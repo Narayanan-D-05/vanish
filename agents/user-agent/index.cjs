@@ -57,9 +57,11 @@ class UserAgent {
    */
   async fragmentBalance(totalAmount, numWorkers) {
     console.log(`💥 STEP 2: BALANCE FRAGMENTATION\n`);
-    console.log(`   Creating ${numWorkers} worker accounts with ${totalAmount / numWorkers} HBAR each\n`);
+    
+    // Round to 8 decimal places (HBAR precision limit)
+    const fragmentSize = Math.floor((totalAmount / numWorkers) * 100000000) / 100000000;
+    console.log(`   Creating ${numWorkers} worker accounts with ${fragmentSize} HBAR each\n`);
 
-    const fragmentSize = totalAmount / numWorkers;
     this.workerAccounts = [];
 
     // Create real worker accounts on Hedera
@@ -85,21 +87,31 @@ class UserAgent {
     console.log(`🔄 STEP 3: AGENTIC MIX (SaucerSwap)\n`);
     console.log(`   Swapping ${amount} HBAR → USDC\n`);
 
-    const SaucerSwapIntegration = require('../../lib/saucerswap.cjs');
-    const swapManager = new SaucerSwapIntegration(this.client, this.accountId);
-    
-    // Swap HBAR to USDC (breaks transaction graph)
-    const minAmountOut = 0; // In production, calculate proper slippage
-    const result = await swapManager.swapHBARForToken(amount, 'USDC', minAmountOut);
+    try {
+      const SaucerSwapIntegration = require('../../lib/saucerswap.cjs');
+      const swapManager = new SaucerSwapIntegration(this.client, this.accountId);
+      
+      // Swap HBAR to USDC (breaks transaction graph)
+      const minAmountOut = 0; // In production, calculate proper slippage
+      const result = await swapManager.swapHBARForToken(amount, 'USDC', minAmountOut);
 
-    console.log(`   ✅ Swap complete: ${result.transactionId}\n`);
+      console.log(`   ✅ Swap complete: ${result.transactionId}\n`);
 
-    return {
-      success: true,
-      transactionId: result.transactionId,
-      originalAmount: amount,
-      targetToken: 'USDC'
-    };
+      return {
+        success: true,
+        transactionId: result.transactionId,
+        originalAmount: amount,
+        targetToken: 'USDC'
+      };
+    } catch (error) {
+      console.log(`   ⚠️  Swap skipped (${error.message.split(':')[0]})`);
+      console.log(`   ℹ️  Continuing with HBAR transfer (swap optional)\n`);
+      return {
+        success: false,
+        skipped: true,
+        originalAmount: amount
+      };
+    }
   }
 
   /**
@@ -115,12 +127,18 @@ class UserAgent {
     const commitment = this.hashCommitment(secret, nullifier);
     console.log(`   ✅ Generated commitment: ${commitment.slice(0, 16)}...`);
     
+    // Generate nullifier hash
+    const nullifierHash = prover.generateNullifierHash(nullifier);
+    
     // Generate zk-SNARK proof
-    const proof = await prover.generateDepositProof({
-      secret,
-      nullifier,
-      commitment,
-      amount
+    // Circuit inputs: root, nullifierHash (public); secret, nullifier, pathElements, pathIndices (private)
+    const proof = await prover.generateShieldProof({
+      root: '0',
+      nullifierHash: nullifierHash,
+      secret: secret,
+      nullifier: nullifier,
+      pathElements: Array(20).fill('0'),
+      pathIndices: Array(20).fill(0)
     });
     
     console.log(`   ✅ Generated zk-SNARK proof\n`);
@@ -129,6 +147,7 @@ class UserAgent {
       commitment,
       secret,
       nullifier,
+      nullifierHash,
       proof,
       amount
     };
@@ -235,8 +254,9 @@ async generateStealthAddressForReceiver(receiverMetaAddress, amount) {
       await this.performAgenticMix(amount);
 
       // Step 4: zk-SNARK Commitment
-      const secret = Math.random().toString(36);
-      const nullifier = Math.random().toString(36);
+      const crypto = require('crypto');
+      const secret = BigInt('0x' + crypto.randomBytes(31).toString('hex')).toString();
+      const nullifier = BigInt('0x' + crypto.randomBytes(31).toString('hex')).toString();
       const commitment = await this.generateZKCommitment(secret, nullifier, amount);
 
       // Step 5: Generate Stealth Address

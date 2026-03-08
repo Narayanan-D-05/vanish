@@ -31,7 +31,8 @@ class ZKProver {
    * @returns {string} Nullifier hash
    */
   generateNullifierHash(nullifier) {
-    return keccak256(nullifier);
+    const hash = keccak256(nullifier);
+    return BigInt('0x' + hash).toString();
   }
 
   /**
