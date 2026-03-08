@@ -1,0 +1,52 @@
+{
+  "name": "vanish",
+  "version": "1.0.0",
+  "description": "Double-Blind AI Privacy Layer for Hedera - A Confidential AI Agent that shields wallet balances and transaction history",
+  "main": "index.js",
+  "scripts": {
+    "create:account": "node create-new-account.cjs",
+    "setup:topics": "node setup-topics.cjs",
+    "compile": "hardhat compile",
+    "deploy:contract": "hardhat run scripts/deploy.js",
+    "associate:tokens": "node associate-tokens.cjs",
+    "verify:production": "node verify-production.cjs",
+    "start:pool": "node agents/pool-manager/index.cjs",
+    "start:user": "node agents/user-agent/index.cjs",
+    "start:receiver": "node agents/receiver-agent/index.cjs",
+    "build:circuits": "cd circuits && circom shield.circom --r1cs --wasm --sym && circom withdraw.circom --r1cs --wasm --sym",
+    "setup:trusted": "cd circuits && snarkjs groth16 setup shield.r1cs pot12_final.ptau shield_0000.zkey",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "hedera",
+    "privacy",
+    "ai-agents",
+    "zk-snarks",
+    "stealth-addresses",
+    "blockchain",
+    "HIP-1340",
+    "HTS",
+    "HCS"
+  ],
+  "author": "Vanish Team",
+  "license": "MIT",
+  "dependencies": {
+    "@hashgraph/sdk": "^2.80.0",
+    "axios": "^1.13.6",
+    "circomlibjs": "^0.1.7",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.16.0",
+    "js-sha3": "^0.9.3",
+    "snarkjs": "^0.7.6",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^4.0.6",
+    "hardhat": "^3.1.11"
+  }
+}
