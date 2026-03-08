@@ -269,7 +269,9 @@ class PoolManager {
       .setStartTime(0)
       .subscribe(this.client, null, (message) => {
         try {
-          const payload = JSON.parse(Buffer.from(message.contents).toString());
+          // HCS message.contents is a Uint8Array - convert to string then parse JSON
+          const messageString = Buffer.from(message.contents).toString('utf8');
+          const payload = JSON.parse(messageString);
           
           if (payload.type === 'PROOF_SUBMISSION') {
             console.log(`📩 Received proof submission: ${payload.submissionId}`);

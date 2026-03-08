@@ -109,7 +109,9 @@ class ReceiverAgent {
       .setStartTime(0) // Start from beginning (or use last scanned time)
       .subscribe(this.client, null, async (message) => {
         try {
-          const payload = JSON.parse(Buffer.from(message.contents).toString());
+          // HCS message.contents is a Uint8Array - convert to string then parse JSON
+          const messageString = Buffer.from(message.contents).toString('utf8');
+          const payload = JSON.parse(messageString);
           
           // Check for stealth address announcements
           if (payload.type === 'STEALTH_ANNOUNCEMENT') {
@@ -122,7 +124,12 @@ class ReceiverAgent {
           }
           
         } catch (error) {
-          // Ignore malformed messages
+          // Log parsing errors for debugging (but don't crash)
+          console.error('Error processing HCS message:', error.message);
+          if (message.contents) {
+            const rawMessage = Buffer.from(message.contents).toString('utf8');
+            console.error('Raw message (first 100 chars):', rawMessage.substring(0, 100));
+          }
         }
       });
   }
