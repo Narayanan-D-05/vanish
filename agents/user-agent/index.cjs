@@ -846,6 +846,7 @@ Be concise, technical, and privacy-focused in your responses.`;
     try {
       const message = JSON.stringify({
         type: 'PROOF_SUBMISSION',
+        proofType: 'shield', // Specify proof type for verification
         submissionId: crypto.randomBytes(16).toString('hex'),
         timestamp: Date.now(),
         proof: proofData.proof,
