@@ -317,12 +317,23 @@ class UserAgent {
           // Store secret
           this.userSecrets.set(secretData.secretId, secretData.secret);
           
+          // Submit proof to Pool Manager
+          console.log(`       📤 Submitting to Pool Manager...`);
+          const submitted = await this.submitProofToPoolManager({
+            proof: data.proof,
+            publicSignals: data.publicSignals,
+            commitment: data.commitment,
+            nullifierHash: data.nullifierHash,
+            amount: fragmentAmount
+          });
+          
           results.push({
             fragmentId: i + 1,
             amount: fragmentAmount,
             commitment: data.commitment,
             nullifierHash: data.nullifierHash,
             secretId: secretData.secretId,
+            submitted: submitted,
             success: true
           });
         } else {
@@ -436,12 +447,23 @@ class UserAgent {
               timestamp: new Date().toISOString(),
             });
             
+            // Submit proof to Pool Manager
+            console.log(`       📤 Submitting to Pool Manager...`);
+            const submitted = await this.submitProofToPoolManager({
+              proof: data.proof,
+              publicSignals: data.publicSignals,
+              commitment: data.commitment,
+              nullifierHash: data.nullifierHash,
+              amount: plan.fragmentAmounts[i]
+            });
+            
             results.push({
               success: true,
               fragmentId: i + 1,
               amount: plan.fragmentAmounts[i],
               commitment: data.commitment,
               secretId: secretId,
+              submitted: submitted,
             });
           } else {
             results.push({
@@ -814,6 +836,35 @@ Be concise, technical, and privacy-focused in your responses.`;
     } catch (error) {
       console.error('❌ Error processing command:', error.message);
       return `Error: ${error.message}. Make sure Ollama is running (ollama serve).`;
+    }
+  }
+  
+  /**
+   * Submit proof to Pool Manager via HCS private topic
+   */
+  async submitProofToPoolManager(proofData) {
+    try {
+      const message = JSON.stringify({
+        type: 'PROOF_SUBMISSION',
+        submissionId: crypto.randomBytes(16).toString('hex'),
+        timestamp: Date.now(),
+        proof: proofData.proof,
+        publicSignals: proofData.publicSignals,
+        commitment: proofData.commitment,
+        nullifierHash: proofData.nullifierHash,
+        amount: proofData.amount,
+        submitter: this.accountId.toString()
+      });
+      
+      const transaction = new TopicMessageSubmitTransaction()
+        .setTopicId(this.privateTopic)
+        .setMessage(message);
+      
+      await transaction.execute(this.client);
+      return true;
+    } catch (error) {
+      console.error(`   ❌ Submission failed: ${error.message}`);
+      return false;
     }
   }
   
