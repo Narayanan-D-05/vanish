@@ -109,8 +109,18 @@ class ReceiverAgent {
       .setStartTime(0) // Start from beginning (or use last scanned time)
       .subscribe(this.client, null, async (message) => {
         try {
-          // HCS message.contents is a Uint8Array - convert to string then parse JSON
-          const messageString = Buffer.from(message.contents).toString('utf8');
+          // HCS message.contents can be base64 encoded or raw bytes
+          let messageString = Buffer.from(message.contents).toString('utf8');
+          
+          // Check if it's base64 encoded (starts with eyJ which is base64 for "{")
+          if (messageString.startsWith('eyJ') || messageString.match(/^[A-Za-z0-9+/=]+$/)) {
+            try {
+              messageString = Buffer.from(messageString, 'base64').toString('utf8');
+            } catch (e) {
+              // Not base64, use as-is
+            }
+          }
+          
           const payload = JSON.parse(messageString);
           
           // Check for stealth address announcements
