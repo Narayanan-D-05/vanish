@@ -13,7 +13,12 @@
     "verify:production": "node verify-production.cjs",
     "start:pool": "node agents/pool-manager/index.cjs",
     "start:user": "node agents/user-agent/index.cjs",
+    "start:user:ai": "node agents/user-agent/ai-mode.cjs",
     "start:receiver": "node agents/receiver-agent/index.cjs",
+    "test:agents": "node test-agents.cjs",
+    "test:fragmentation": "node test-fragmentation.cjs",
+    "test:ai": "node test-ai-vs-rules.cjs",
+    "test:performance": "node test-performance.cjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
@@ -31,12 +36,19 @@
   "license": "MIT",
   "dependencies": {
     "@hashgraph/sdk": "^2.80.0",
+    "@langchain/community": "^1.1.22",
+    "@langchain/core": "^1.1.31",
+    "@langchain/ollama": "^1.2.6",
+    "@langchain/openai": "^1.2.12",
     "axios": "^1.13.6",
     "circomlib": "^2.0.5",
     "circomlibjs": "^0.1.7",
     "dotenv": "^16.4.5",
     "ethers": "^6.16.0",
+    "hedera-agent-kit": "^3.8.0",
     "js-sha3": "^0.9.3",
+    "langchain": "^1.2.30",
+    "ollama": "^0.6.3",
     "snarkjs": "^0.7.6",
     "tweetnacl": "^1.0.3",
     "tweetnacl-util": "^0.15.1"
