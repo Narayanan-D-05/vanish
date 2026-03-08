@@ -266,7 +266,7 @@ class PoolManager {
     
     new TopicMessageQuery()
       .setTopicId(this.privateTopic)
-      .setStartTime(0)
+      .setStartTime(Math.floor(Date.now() / 1000)) // Only new messages from now on
       .subscribe(this.client, null, (message) => {
         try {
           // HCS message.contents can be base64 encoded or raw bytes
@@ -285,6 +285,13 @@ class PoolManager {
           
           if (payload.type === 'PROOF_SUBMISSION') {
             console.log(`📩 Received proof submission: ${payload.submissionId}`);
+            
+            // Skip old messages without proofType
+            if (!payload.proofType) {
+              console.log('   ⚠️  Skipping old proof (no proofType field)');
+              return;
+            }
+            
             this.addProofToQueue(payload);
           }
           

@@ -106,7 +106,7 @@ class ReceiverAgent {
     
     new TopicMessageQuery()
       .setTopicId(this.publicTopic)
-      .setStartTime(0) // Start from beginning (or use last scanned time)
+      .setStartTime(Math.floor(Date.now() / 1000)) // Only new messages from now on
       .subscribe(this.client, null, async (message) => {
         try {
           // HCS message.contents can be base64 encoded or raw bytes
