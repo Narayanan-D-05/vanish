@@ -103,12 +103,6 @@ class PoolManagerAgent {
     console.log('🔐 Verifying zk-SNARK proof...');
 
     try {
-      // Check if proof is placeholder
-      if (proof.placeholder) {
-        console.log('⚠️  Placeholder proof detected (development mode)');
-        return this.verifyPlaceholderProof(proof, publicSignals);
-      }
-
       // Verify using snarkjs
       const isValid = await this.zkProver.verifyProof(proof.proof, publicSignals);
 
@@ -141,27 +135,8 @@ class PoolManagerAgent {
 
     } catch (error) {
       console.error('❌ Proof verification error:', error.message);
-      return false;
+      throw error;
     }
-  }
-
-  /**
-   * Verify placeholder proof (for development)
-   */
-  verifyPlaceholderProof(proof, publicSignals) {
-    console.log('⚠️  Using placeholder verification (dev mode)');
-
-    // Basic checks for placeholder
-    const nullifierHash = publicSignals[1];
-    
-    if (this.nullifiers.has(nullifierHash)) {
-      console.log('❌ Nullifier already used\n');
-      return false;
-    }
-
-    this.nullifiers.add(nullifierHash);
-    console.log('✅ Placeholder proof accepted\n');
-    return true;
   }
 
   /**

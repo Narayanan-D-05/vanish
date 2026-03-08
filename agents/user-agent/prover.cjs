@@ -51,13 +51,16 @@ class ZKProver {
       // - pathElements: Merkle proof path
       // - pathIndices: Merkle proof indices
 
-      const circuitWasmPath = path.join(this.circuitPath, 'shield.wasm');
+      const circuitWasmPath = path.join(this.circuitPath, 'build/shield_js/shield.wasm');
       const provingKeyPath = path.join(this.circuitPath, 'shield_final.zkey');
 
       // Check if circuit files exist
       if (!fs.existsSync(circuitWasmPath)) {
-        console.warn('⚠️  Circuit WASM not found. Generate placeholder proof.');
-        return this.generatePlaceholderProof(input);
+        throw new Error(`Circuit WASM not found at ${circuitWasmPath}. Run: npm run compile:circuits`);
+      }
+
+      if (!fs.existsSync(provingKeyPath)) {
+        throw new Error(`Proving key not found at ${provingKeyPath}. Run: npm run compile:circuits`);
       }
 
       // Generate witness
@@ -77,7 +80,7 @@ class ZKProver {
       };
     } catch (error) {
       console.error('Error generating proof:', error.message);
-      return this.generatePlaceholderProof(input);
+      throw error;
     }
   }
 
@@ -90,12 +93,15 @@ class ZKProver {
     console.log('Generating zk-SNARK withdrawal proof...');
 
     try {
-      const circuitWasmPath = path.join(this.circuitPath, 'withdraw.wasm');
+      const circuitWasmPath = path.join(this.circuitPath, 'build/withdraw_js/withdraw.wasm');
       const provingKeyPath = path.join(this.circuitPath, 'withdraw_final.zkey');
 
       if (!fs.existsSync(circuitWasmPath)) {
-        console.warn('⚠️  Circuit WASM not found. Generate placeholder proof.');
-        return this.generatePlaceholderProof(input);
+        throw new Error(`Circuit WASM not found at ${circuitWasmPath}. Run: npm run compile:circuits`);
+      }
+
+      if (!fs.existsSync(provingKeyPath)) {
+        throw new Error(`Proving key not found at ${provingKeyPath}. Run: npm run compile:circuits`);
       }
 
       const { proof, publicSignals } = await snarkjs.groth16.fullProve(
@@ -115,7 +121,7 @@ class ZKProver {
       };
     } catch (error) {
       console.error('Error generating proof:', error.message);
-      return this.generatePlaceholderProof(input);
+      throw error;
     }
   }
 

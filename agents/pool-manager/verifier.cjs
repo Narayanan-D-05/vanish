@@ -19,18 +19,18 @@ class ProofVerifier {
    */
   loadVerificationKey() {
     try {
-      const keyPath = path.join(this.circuitPath, 'verification_key.json');
+      const keyPath = path.join(this.circuitPath, 'shield_verification_key.json');
       
       if (fs.existsSync(keyPath)) {
         this.verificationKey = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
         console.log('✅ Verification key loaded');
       } else {
-        console.warn('⚠️  Verification key not found. Using placeholder mode.');
-        this.verificationKey = null;
+        console.error('❌ Verification key not found at:', keyPath);
+        throw new Error('Verification key is required - no mock mode allowed');
       }
     } catch (error) {
       console.error('Error loading verification key:', error.message);
-      this.verificationKey = null;
+      throw error;
     }
   }
 
@@ -42,11 +42,6 @@ class ProofVerifier {
    */
   async verify(proof, publicSignals) {
     try {
-      if (!this.verificationKey) {
-        console.warn('⚠️  No verification key - using mock verification');
-        return this.mockVerify(proof, publicSignals);
-      }
-
       // Verify using snarkjs
       const isValid = await snarkjs.groth16.verify(
         this.verificationKey,
@@ -57,29 +52,11 @@ class ProofVerifier {
       return isValid;
     } catch (error) {
       console.error('Verification error:', error.message);
-      return false;
+      throw error;
     }
   }
 
   /**
-   * Mock verification for development
-   */
-  mockVerify(proof, publicSignals) {
-    console.log('Using mock verification (development mode)');
-    
-    // Basic sanity checks
-    if (!proof || !publicSignals) {
-      return false;
-    }
-
-    if (publicSignals.length !== 2) {
-      return false;
-    }
-
-    // In dev mode, accept all non-null proofs
-    return true;
-  }
-
   /**
    * Verify Merkle proof
    * @param {string} leaf - Leaf node (commitment)

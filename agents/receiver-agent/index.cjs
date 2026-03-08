@@ -1,8 +1,8 @@
 require('dotenv').config();
 const { Client, PrivateKey } = require('@hashgraph/sdk');
 const axios = require('axios');
-const StealthAddressGenerator = require('../../lib/stealth');
-const HCSPrivateMessaging = require('../../lib/hcs-private');
+const StealthAddressGenerator = require('../../lib/stealth.cjs');
+const HCSPrivateMessaging = require('../../lib/hcs-private.cjs');
 
 /**
  * Receiver Agent (Stealth Watcher)
@@ -227,13 +227,10 @@ class ReceiverAgent {
         .addHbarTransfer(stealthTransfer.stealthAddress, new Hbar(-stealthTransfer.amount))
         .addHbarTransfer(this.accountId, new Hbar(stealthTransfer.amount));
 
-      console.log('⚠️  Actual claim not yet implemented (placeholder)');
-      console.log('✅ Simulated claim complete\n');
-
-      // const response = await tx.execute(stealthClient);
-      // const receipt = await response.getReceipt(stealthClient);
+      const response = await tx.execute(stealthClient);
+      const receipt = await response.getReceipt(stealthClient);
       
-      // console.log(`✅ Funds claimed! Transaction: ${response.transactionId}\n`);
+      console.log(`✅ Funds claimed! Transaction: ${response.transactionId}\n`);
 
       stealthClient.close();
     } catch (error) {
