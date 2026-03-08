@@ -102,7 +102,9 @@ class ReceiverAgent {
    * Scan HCS for stealth address announcements
    */
   async startScanning() {
-    console.log('🔍 Scanning HCS for stealth address announcements...\n');
+    console.log('🔍 Scanning HCS for stealth address announcements...');
+    console.log(`   Listening to PUBLIC topic: ${this.publicTopic}`);
+    console.log(`   Waiting for STEALTH_ANNOUNCEMENT and PRIVACY_BATCH messages...\n`);
     
     new TopicMessageQuery()
       .setTopicId(this.publicTopic)
@@ -123,19 +125,26 @@ class ReceiverAgent {
           
           const payload = JSON.parse(messageString);
           
+          // Log all received message types for debugging
+          console.log(`📨 Received HCS message: ${payload.type || 'UNKNOWN'}`);
+          
           // Check for stealth address announcements
           if (payload.type === 'STEALTH_ANNOUNCEMENT') {
             await this.processStealthAnnouncement(payload);
           }
           
           // Check for batch completions (funds are now available)
-          if (payload.type === 'PRIVACY_BATCH') {
+          else if (payload.type === 'PRIVACY_BATCH') {
             await this.checkBatchForFunds(payload);
+          }
+          
+          else {
+            console.log(`   ⚠️  Unhandled message type: ${payload.type}\n`);
           }
           
         } catch (error) {
           // Log parsing errors for debugging (but don't crash)
-          console.error('Error processing HCS message:', error.message);
+          console.error('❌ Error processing HCS message:', error.message);
           if (message.contents) {
             const rawMessage = Buffer.from(message.contents).toString('utf8');
             console.error('Raw message (first 100 chars):', rawMessage.substring(0, 100));
@@ -173,11 +182,17 @@ class ReceiverAgent {
     // In production, would parse batch data and check if any
     // nullifiers correspond to our detected stealth addresses
     
+    console.log('📦 PRIVACY_BATCH received!');
+    console.log(`   Batch ID: ${batchData.batchId}`);
+    console.log(`   Batch Size: ${batchData.batchSize} proofs`);
+    console.log(`   Merkle Root: ${batchData.newMerkleRoot}`);
+    console.log(`   Detected stealth addresses: ${this.detectedAddresses.size}\n`);
+    
     // For now, we'll claim funds when we detect a batch and we have
     // pending stealth addresses
     
     if (this.detectedAddresses.size > 0) {
-      console.log('📦 Batch completed. Checking for claimable funds...');
+      console.log('💰 Checking for claimable funds...');
       
       // Iterate through detected addresses
       for (const stealthAddress of this.detectedAddresses) {
