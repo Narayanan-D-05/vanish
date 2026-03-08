@@ -33,12 +33,12 @@ class PoolManager {
     this.privateTopic = process.env.PRIVATE_TOPIC_ID;
     this.publicTopic = process.env.PUBLIC_ANNOUNCEMENT_TOPIC_ID;
     
-    // Batching configuration (2026 Hybrid Strategy)
+    // Batching configuration (DEMO MODE - reduced delays)
     this.proofQueue = [];
-    this.MIN_BATCH_SIZE = 5;          // Minimum anonymity set
-    this.MAX_WAIT_TIME = 30 * 60 * 1000;  // 30 minutes in ms
-    this.MIN_RANDOM_DELAY = 5 * 60 * 1000;  // 5 minutes
-    this.MAX_RANDOM_DELAY = 15 * 60 * 1000; // 15 minutes
+    this.MIN_BATCH_SIZE = 2;          // Minimum anonymity set (reduced for demo)
+    this.MAX_WAIT_TIME = 2 * 60 * 1000;  // 2 minutes in ms (reduced for demo)
+    this.MIN_RANDOM_DELAY = 10 * 1000;  // 10 seconds (reduced for demo)
+    this.MAX_RANDOM_DELAY = 30 * 1000;  // 30 seconds (reduced for demo)
     
     // Timing tracking
     this.firstProofTimestamp = null;
@@ -47,10 +47,10 @@ class PoolManager {
     // Load verification keys
     this.loadVerificationKeys();
     
-    console.log('🔒 Pool Manager initialized');
+    console.log('🔒 Pool Manager initialized (DEMO MODE)');
     console.log(`   Account: ${this.accountId}`);
     console.log(`   Batching: Min ${this.MIN_BATCH_SIZE} proofs OR ${this.MAX_WAIT_TIME / 60000} minutes`);
-    console.log(`   Random delay: ${this.MIN_RANDOM_DELAY / 60000}-${this.MAX_RANDOM_DELAY / 60000} minutes`);
+    console.log(`   Random delay: ${this.MIN_RANDOM_DELAY / 1000}-${this.MAX_RANDOM_DELAY / 1000} seconds`);
   }
   
   async loadVerificationKeys() {
