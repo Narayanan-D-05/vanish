@@ -12,8 +12,8 @@ const https = require('https');
  */
 
 const CIRCUITS_DIR = path.join(__dirname, 'circuits');
-const PTAU_FILE = 'powersOfTau28_hez_final_12.ptau';
-const PTAU_URL = `https://hermez.s3-eu-west-1.amazonaws.com/${PTAU_FILE}`;
+const PTAU_FILE = 'powersOfTau28_hez_final_15.ptau';
+const PTAU_URL = `https://storage.googleapis.com/zkevm/ptau/${PTAU_FILE}`;
 
 function runCommand(command, cwd = process.cwd()) {
   return new Promise((resolve, reject) => {
