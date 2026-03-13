@@ -1,0 +1,11 @@
+{
+  "version": "2026.1",
+  "minBatchSize": 2,
+  "maxBatchSize": 20,
+  "maxWaitMinutes": 2,
+  "minDelaySeconds": 10,
+  "maxDelayMinutes": 1,
+  "allowedDenominations": [],
+  "denominationPrecision": 2,
+  "aiDecisionTimeoutMs": 5000
+}
