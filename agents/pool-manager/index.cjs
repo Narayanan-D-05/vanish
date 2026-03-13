@@ -20,6 +20,7 @@ const snarkjs = require('snarkjs');
 const fs = require('fs').promises;
 const path = require('path');
 const { keccak256 } = require('ethers');
+const DelegationManager = require('../../lib/delegation.cjs');
 
 class PoolManager {
   constructor() {
@@ -111,6 +112,23 @@ class PoolManager {
     if (!isValid) {
       console.log('❌ Rejected invalid proof');
       return false;
+    }
+    
+    // HIP-1340: Pull funds from submitter's account to pool contract
+    if (proofData.submitter && process.env.POOL_CONTRACT_ID) {
+      try {
+        const delegation = new DelegationManager(this.client);
+        const receipt = await delegation.executeDelegatedTransfer(
+          proofData.submitter,
+          process.env.POOL_CONTRACT_ID,
+          proofData.amount
+        );
+        console.log(`   💸 HIP-1340 pull: ${proofData.amount} HBAR from ${proofData.submitter} → Pool Contract`);
+        console.log(`   Tx: ${receipt.transactionId}`);
+      } catch (err) {
+        console.error(`   ⚠️  Fund pull failed: ${err.message}`);
+        // Still queue the proof — don't block if transfer fails in demo
+      }
     }
     
     // Add to queue

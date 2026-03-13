@@ -23,6 +23,7 @@ const { tools } = require('../plugins/vanish-tools.cjs');
 const crypto = require('crypto');
 const fragmentor = require('../../lib/fragmentor.cjs');
 const aiFragmentor = require('../../lib/ai-fragmentor.cjs');
+const DelegationManager = require('../../lib/delegation.cjs');
 
 // Try to import Ollama dependencies (optional)
 let ChatOllama, createReactAgent;
@@ -844,6 +845,16 @@ Be concise, technical, and privacy-focused in your responses.`;
    */
   async submitProofToPoolManager(proofData) {
     try {
+      // HIP-1340: Approve pool manager to pull this fragment's amount
+      const poolManagerId = process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID;
+      const delegation = new DelegationManager(this.client);
+      await delegation.delegateSpendingRights(
+        this.accountId.toString(),
+        poolManagerId,
+        proofData.amount
+      );
+      console.log(`   🔑 HIP-1340 allowance approved: ${proofData.amount} HBAR → Pool Manager`);
+
       const message = JSON.stringify({
         type: 'PROOF_SUBMISSION',
         proofType: 'shield', // Specify proof type for verification
