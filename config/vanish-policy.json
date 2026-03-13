@@ -7,5 +7,10 @@
   "maxDelayMinutes": 1,
   "allowedDenominations": [],
   "denominationPrecision": 2,
-  "aiDecisionTimeoutMs": 5000
+  "aiDecisionTimeoutMs": 5000,
+  "maxAmlRiskScore": 50,
+  "allowedDestinations": [
+    "0.0.8208114",
+    "0.0.123456"
+  ]
 }

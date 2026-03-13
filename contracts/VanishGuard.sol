@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title VanishGuard
+ * @notice On-chain policy enforcement for the Vanish privacy protocol.
+ *
+ * This contract is the FINAL JUDGE for every batch execution and shield deposit.
+ * It mirrors the off-chain policy-engine (lib/policy-engine.cjs) so that even if
+ * a malicious or buggy pool-manager submits bad decisions, the chain rejects them.
+ *
+ * Policy rules enforced:
+ *  - batchSize must be in [minBatchSize, maxBatchSize]
+ *  - delayMs must be in [minDelaySeconds*1000, maxDelayMinutes*60000]
+ *  - execute=true only when size OR time condition is met (checked via queueAge)
+ *  - shield deposits must use an allowed denomination (in tinybars)
+ *  - nullifiers cannot be reused (replay protection)
+ *
+ * Denominations are stored in TINYBARS (1 HBAR = 100,000,000 tinybars) for
+ * integer precision. Off-chain policy stores them in HBAR for readability.
+ */
+contract VanishGuard {
+    // ─────────────────────────────────────────────
+    //  Types
+    // ─────────────────────────────────────────────
+
+    struct Policy {
+        uint32  minBatchSize;       // inclusive
+        uint32  maxBatchSize;       // inclusive
+        uint32  minDelaySeconds;    // minimum execution delay
+        uint32  maxDelayMinutes;    // maximum execution delay
+        uint32  maxWaitMinutes;     // queue age that triggers forced execution
+        uint256[] allowedDenominations; // in tinybars (0 = denomination-free)
+        string  version;
+    }
+
+    // ─────────────────────────────────────────────
+    //  Storage
+    // ─────────────────────────────────────────────
+
+    address public owner;
+    address public decisionSigner;
+    Policy  public policy;
+
+    mapping(uint256 => bool) public nullifiers;
+    mapping(bytes32 => bool) public decisionEnvelopeSeen;
+
+    uint256 public totalBatchesApproved;
+    uint256 public totalDepositsShielded;
+
+    // ─────────────────────────────────────────────
+    //  Events
+    // ─────────────────────────────────────────────
+
+    event PolicyUpdated(
+        string  indexed version,
+        uint32  minBatchSize,
+        uint32  maxBatchSize,
+        uint32  minDelaySeconds,
+        uint32  maxDelayMinutes,
+        uint256 denominationCount
+    );
+
+    event BatchApproved(
+        bytes32 indexed merkleRoot,
+        bytes32 indexed auditHash,
+        uint32  batchSize,
+        uint256 delayMs,
+        uint256 timestamp
+    );
+
+    event DecisionEnvelopeAnchored(
+        bytes32 indexed decisionEnvelopeHash,
+        address indexed recoveredSigner,
+        bytes32 signatureHash,
+        uint256 timestamp
+    );
+
+    event DecisionSignerUpdated(address indexed oldSigner, address indexed newSigner);
+
+    event DepositShielded(
+        bytes32 indexed commitment,
+        uint256 amountTinybars,
+        uint256 timestamp
+    );
+
+    // ─────────────────────────────────────────────
+    //  Errors
+    // ─────────────────────────────────────────────
+
+    error OnlyOwner();
+    error BatchSizeTooSmall(uint32 got, uint32 min);
+    error BatchSizeTooLarge(uint32 got, uint32 max);
+    error DelayTooShort(uint256 gotMs, uint256 minMs);
+    error DelayTooLong(uint256 gotMs, uint256 maxMs);
+    error ExecuteConditionNotMet(uint32 queueSize, uint32 minBatch, uint256 queueAgeMs, uint256 maxWaitMs);
+    error DenominationNotAllowed(uint256 amountTinybars);
+    error NullifierAlreadyUsed(uint256 nullifierHash);
+    error EmptyMerkleRoot();
+    error EmptyAuditHash();
+    error EmptyDecisionEnvelopeHash();
+    error DecisionEnvelopeReplay(bytes32 envelopeHash);
+    error InvalidDecisionSignature(address recovered, address expected);
+    error InvalidDecisionSigner(address signer);
+
+    // ─────────────────────────────────────────────
+    //  Constructor
+    // ─────────────────────────────────────────────
+
+    /**
+     * @param minBatchSize        Minimum proofs per batch
+     * @param maxBatchSize        Maximum proofs per batch
+     * @param minDelaySeconds     Minimum execution delay (seconds)
+     * @param maxDelayMinutes     Maximum execution delay (minutes)
+     * @param maxWaitMinutes      Queue age that forces execution regardless of size
+     * @param allowedDenoms       Allowed shield amounts in TINYBARS (empty = unrestricted)
+     * @param policyVersion       Human-readable version tag (e.g. "2026.1")
+     */
+    constructor(
+        uint32  minBatchSize,
+        uint32  maxBatchSize,
+        uint32  minDelaySeconds,
+        uint32  maxDelayMinutes,
+        uint32  maxWaitMinutes,
+        uint256[] memory allowedDenoms,
+        string  memory policyVersion
+    ) {
+        owner = msg.sender;
+        decisionSigner = msg.sender;
+        _setPolicy(
+            minBatchSize,
+            maxBatchSize,
+            minDelaySeconds,
+            maxDelayMinutes,
+            maxWaitMinutes,
+            allowedDenoms,
+            policyVersion
+        );
+    }
+
+    // ─────────────────────────────────────────────
+    //  Admin
+    // ─────────────────────────────────────────────
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert OnlyOwner();
+        _;
+    }
+
+    /**
+     * @notice Update the on-chain policy. Can only be called by owner.
+     */
+    function setPolicy(
+        uint32  minBatchSize,
+        uint32  maxBatchSize,
+        uint32  minDelaySeconds,
+        uint32  maxDelayMinutes,
+        uint32  maxWaitMinutes,
+        uint256[] calldata allowedDenoms,
+        string  calldata policyVersion
+    ) external onlyOwner {
+        _setPolicy(
+            minBatchSize,
+            maxBatchSize,
+            minDelaySeconds,
+            maxDelayMinutes,
+            maxWaitMinutes,
+            allowedDenoms,
+            policyVersion
+        );
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "VanishGuard: zero address");
+        owner = newOwner;
+    }
+
+    function setDecisionSigner(address newSigner) external onlyOwner {
+        if (newSigner == address(0)) revert InvalidDecisionSigner(newSigner);
+        address oldSigner = decisionSigner;
+        decisionSigner = newSigner;
+        emit DecisionSignerUpdated(oldSigner, newSigner);
+    }
+
+    // ─────────────────────────────────────────────
+    //  Core: Batch Submission
+    // ─────────────────────────────────────────────
+
+    /**
+     * @notice Submit a batch for on-chain approval.
+     *
+     * @param batchSize    Number of proofs in the batch
+     * @param delayMs      Execution delay the pool manager waited (milliseconds)
+     * @param queueAgeMs   How long the queue has been open (milliseconds). Used for
+     *                     the time-condition check (if age >= maxWait → execute is valid).
+     * @param merkleRoot   New Merkle root after this batch
+     * @param auditHash    SHA-256 (or keccak256) of the HCS AI_DECISION_AUDIT message
+     *                     — links the on-chain approval to the off-chain signed audit.
+     *
+     * Emits BatchApproved on success, reverts otherwise.
+     */
+    function submitBatch(
+        uint32  batchSize,
+        uint256 delayMs,
+        uint256 queueAgeMs,
+        bytes32 merkleRoot,
+        bytes32 auditHash
+    ) external {
+        _submitBatchInternal(batchSize, delayMs, queueAgeMs, merkleRoot, auditHash);
+    }
+
+    /**
+     * @notice Submit a batch plus signed AI decision metadata.
+     * @dev On Hedera, pool-manager may use ED25519 signing off-chain; this
+     *      function anchors signature material for external verification and
+     *      enforces non-replay for decision envelopes on-chain.
+     */
+    function submitBatchWithDecision(
+        uint32  batchSize,
+        uint256 delayMs,
+        uint256 queueAgeMs,
+        bytes32 merkleRoot,
+        bytes32 auditHash,
+        bytes32 decisionEnvelopeHash,
+        bytes calldata decisionSignature
+    ) external {
+        if (decisionEnvelopeHash == bytes32(0)) revert EmptyDecisionEnvelopeHash();
+        if (decisionEnvelopeSeen[decisionEnvelopeHash]) revert DecisionEnvelopeReplay(decisionEnvelopeHash);
+
+        address recovered = _recoverDecisionSigner(decisionEnvelopeHash, decisionSignature);
+        if (recovered != decisionSigner) revert InvalidDecisionSignature(recovered, decisionSigner);
+
+        _submitBatchInternal(batchSize, delayMs, queueAgeMs, merkleRoot, auditHash);
+
+        decisionEnvelopeSeen[decisionEnvelopeHash] = true;
+        emit DecisionEnvelopeAnchored(
+            decisionEnvelopeHash,
+            recovered,
+            keccak256(decisionSignature),
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Pure view validation — lets pool-manager pre-check before submitting.
+     *         Returns (true, "") if valid, or (false, reason) if invalid.
+     */
+    function validateBatch(
+        uint32  batchSize,
+        uint256 delayMs,
+        uint256 queueAgeMs
+    ) external view returns (bool valid, string memory reason) {
+        uint256 minDelayMs = uint256(policy.minDelaySeconds) * 1000;
+        uint256 maxDelayMs = uint256(policy.maxDelayMinutes) * 60 * 1000;
+        uint256 maxWaitMs  = uint256(policy.maxWaitMinutes)  * 60 * 1000;
+
+        if (batchSize < policy.minBatchSize) return (false, "batchSize too small");
+        if (batchSize > policy.maxBatchSize) return (false, "batchSize too large");
+        if (delayMs   < minDelayMs)          return (false, "delay too short");
+        if (delayMs   > maxDelayMs)          return (false, "delay too long");
+
+        bool sizeOk = batchSize >= policy.minBatchSize;
+        bool timeOk = queueAgeMs >= maxWaitMs && batchSize > 0;
+        if (!sizeOk && !timeOk) return (false, "execute condition not met");
+
+        return (true, "");
+    }
+
+    // ─────────────────────────────────────────────
+    //  Core: Shield Deposit
+    // ─────────────────────────────────────────────
+
+    /**
+     * @notice Validate and register a shield deposit.
+     *
+     * @param amountTinybars  Deposit amount in tinybars (1 HBAR = 100_000_000 tinybars)
+     * @param commitment      ZK commitment hash (from the shield proof public signals)
+     * @param nullifierHash   Nullifier associated with this commitment (anti-replay)
+     */
+    function shieldDeposit(
+        uint256 amountTinybars,
+        bytes32 commitment,
+        uint256 nullifierHash
+    ) external {
+        // Denomination check
+        _requireAllowedDenomination(amountTinybars);
+
+        // Replay protection
+        if (nullifiers[nullifierHash]) revert NullifierAlreadyUsed(nullifierHash);
+        nullifiers[nullifierHash] = true;
+
+        totalDepositsShielded++;
+
+        emit DepositShielded(commitment, amountTinybars, block.timestamp);
+    }
+
+    /**
+     * @notice Check if an amount (in tinybars) is an allowed denomination.
+     */
+    function isAllowedDenomination(uint256 amountTinybars) external view returns (bool) {
+        return _isDenominationAllowed(amountTinybars);
+    }
+
+    /**
+     * @notice Returns the complete list of allowed denominations (in tinybars).
+     */
+    function getAllowedDenominations() external view returns (uint256[] memory) {
+        return policy.allowedDenominations;
+    }
+
+    /**
+     * @notice Returns key policy parameters as a flat tuple (avoids dynamic array in struct getter).
+     */
+    function getPolicyBounds()
+        external
+        view
+        returns (
+            uint32  minBatchSize,
+            uint32  maxBatchSize,
+            uint32  minDelaySeconds,
+            uint32  maxDelayMinutes,
+            uint32  maxWaitMinutes,
+            string  memory version
+        )
+    {
+        Policy storage p = policy;
+        return (p.minBatchSize, p.maxBatchSize, p.minDelaySeconds, p.maxDelayMinutes, p.maxWaitMinutes, p.version);
+    }
+
+    // ─────────────────────────────────────────────
+    //  Internal
+    // ─────────────────────────────────────────────
+
+    function _setPolicy(
+        uint32  minBatchSize,
+        uint32  maxBatchSize,
+        uint32  minDelaySeconds,
+        uint32  maxDelayMinutes,
+        uint32  maxWaitMinutes,
+        uint256[] memory allowedDenoms,
+        string  memory policyVersion
+    ) internal {
+        require(minBatchSize > 0,         "VanishGuard: minBatchSize=0");
+        require(maxBatchSize >= minBatchSize, "VanishGuard: maxBatch<min");
+        require(minDelaySeconds > 0,      "VanishGuard: minDelay=0");
+        require(maxDelayMinutes > 0,      "VanishGuard: maxDelay=0");
+
+        policy.minBatchSize    = minBatchSize;
+        policy.maxBatchSize    = maxBatchSize;
+        policy.minDelaySeconds = minDelaySeconds;
+        policy.maxDelayMinutes = maxDelayMinutes;
+        policy.maxWaitMinutes  = maxWaitMinutes;
+        policy.version         = policyVersion;
+
+        delete policy.allowedDenominations;
+        for (uint256 i = 0; i < allowedDenoms.length; i++) {
+            policy.allowedDenominations.push(allowedDenoms[i]);
+        }
+
+        emit PolicyUpdated(
+            policyVersion,
+            minBatchSize,
+            maxBatchSize,
+            minDelaySeconds,
+            maxDelayMinutes,
+            allowedDenoms.length
+        );
+    }
+
+    function _validateBatchParams(
+        uint32  batchSize,
+        uint256 delayMs,
+        uint256 queueAgeMs
+    ) internal view {
+        uint256 minDelayMs = uint256(policy.minDelaySeconds) * 1000;
+        uint256 maxDelayMs = uint256(policy.maxDelayMinutes) * 60 * 1000;
+        uint256 maxWaitMs  = uint256(policy.maxWaitMinutes)  * 60 * 1000;
+
+        if (batchSize < policy.minBatchSize)
+            revert BatchSizeTooSmall(batchSize, policy.minBatchSize);
+        if (batchSize > policy.maxBatchSize)
+            revert BatchSizeTooLarge(batchSize, policy.maxBatchSize);
+        if (delayMs < minDelayMs)
+            revert DelayTooShort(delayMs, minDelayMs);
+        if (delayMs > maxDelayMs)
+            revert DelayTooLong(delayMs, maxDelayMs);
+
+        bool sizeOk = batchSize >= policy.minBatchSize;
+        bool timeOk = queueAgeMs >= maxWaitMs && batchSize > 0;
+        if (!sizeOk && !timeOk)
+            revert ExecuteConditionNotMet(batchSize, policy.minBatchSize, queueAgeMs, maxWaitMs);
+    }
+
+    function _submitBatchInternal(
+        uint32  batchSize,
+        uint256 delayMs,
+        uint256 queueAgeMs,
+        bytes32 merkleRoot,
+        bytes32 auditHash
+    ) internal {
+        if (merkleRoot == bytes32(0)) revert EmptyMerkleRoot();
+        if (auditHash  == bytes32(0)) revert EmptyAuditHash();
+
+        _validateBatchParams(batchSize, delayMs, queueAgeMs);
+
+        totalBatchesApproved++;
+        emit BatchApproved(merkleRoot, auditHash, batchSize, delayMs, block.timestamp);
+    }
+
+    function _isDenominationAllowed(uint256 amountTinybars) internal view returns (bool) {
+        uint256[] storage denoms = policy.allowedDenominations;
+        if (denoms.length == 0) return true; // unrestricted
+        for (uint256 i = 0; i < denoms.length; i++) {
+            if (denoms[i] == amountTinybars) return true;
+        }
+        return false;
+    }
+
+    function _requireAllowedDenomination(uint256 amountTinybars) internal view {
+        if (!_isDenominationAllowed(amountTinybars))
+            revert DenominationNotAllowed(amountTinybars);
+    }
+
+    function _recoverDecisionSigner(bytes32 digest, bytes calldata signature)
+        internal
+        pure
+        returns (address)
+    {
+        if (signature.length != 65) return address(0);
+
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+            v := byte(0, calldataload(add(signature.offset, 64)))
+        }
+
+        if (v < 27) v += 27;
+        if (v != 27 && v != 28) return address(0);
+
+        return ecrecover(digest, v, r, s);
+    }
+}

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./withdrawVerifier.sol";
+
 /**
  * @title VanishMerkleTree
  * @dev Merkle tree for storing commitments in the Vanish privacy protocol
@@ -28,12 +30,15 @@ contract VanishMerkleTree {
     error InvalidProof();
     error InvalidCommitment();
     
+    WithdrawVerifier public withdrawVerifier;
+
     /**
-     * @dev Constructor initializes the Merkle tree
+     * @dev Constructor initializes the Merkle tree and the verifier
      */
     constructor() {
         // Initialize root
         currentRoot = 0;
+        withdrawVerifier = new WithdrawVerifier();
     }
     
     /**
@@ -59,7 +64,7 @@ contract VanishMerkleTree {
     
     /**
      * @dev Verify a zk-SNARK proof and execute withdrawal
-     * @param proof The zk-SNARK proof
+     * @param proof The zk-SNARK proof [pA[0], pA[1], pB[0][0], pB[0][1], pB[1][0], pB[1][1], pC[0], pC[1]]
      * @param root The Merkle root
      * @param nullifierHash The nullifier hash
      * @param recipient The recipient address
@@ -125,15 +130,13 @@ contract VanishMerkleTree {
         uint256 nullifierHash,
         uint256 recipient,
         uint256 amount
-    ) internal pure returns (bool) {
-        // In production, use a proper zk-SNARK verifier contract
-        // This is a placeholder for development
+    ) internal view returns (bool) {
+        uint256[2] memory pA = [proof[0], proof[1]];
+        uint256[2][2] memory pB = [[proof[2], proof[3]], [proof[4], proof[5]]];
+        uint256[2] memory pC = [proof[6], proof[7]];
+        uint256[4] memory pubSignals = [root, nullifierHash, recipient, amount];
         
-        // Prevent compiler warnings
-        if (proof.length == 0) return false;
-        if (root == 0 || nullifierHash == 0 || recipient == 0 || amount == 0) return false;
-        
-        return true; // Placeholder
+        return withdrawVerifier.verifyProof(pA, pB, pC, pubSignals);
     }
     
     /**
