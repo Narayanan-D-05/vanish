@@ -1,7 +1,7 @@
 require('dotenv').config();
-const { 
-  Client, 
-  PrivateKey, 
+const {
+  Client,
+  PrivateKey,
   AccountId,
   ContractCreateFlow,
   ContractFunctionParameters,
@@ -30,7 +30,7 @@ async function deployContract() {
     // Initialize client
     const accountId = AccountId.fromString(process.env.HEDERA_ACCOUNT_ID);
     const privateKey = PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY);
-    
+
     const client = Client.forTestnet();
     client.setOperator(accountId, privateKey);
 
@@ -48,10 +48,10 @@ async function deployContract() {
       console.error('❌ Compilation failed:', error.message);
       process.exit(1);
     }
-    
+
     // Read compiled artifact
     const artifactPath = path.join(__dirname, 'artifacts', 'contracts', 'MerkleTree.sol', 'VanishMerkleTree.json');
-    
+
     if (!fs.existsSync(artifactPath)) {
       console.error('❌ Compiled artifact not found');
       console.error(`   Expected: ${artifactPath}`);
@@ -61,7 +61,7 @@ async function deployContract() {
     console.log('📦 Reading compiled bytecode...');
     const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
     const bytecode = artifact.bytecode;
-    
+
     if (!bytecode || bytecode.length < 10) {
       console.error('❌ Invalid bytecode');
       process.exit(1);
@@ -75,7 +75,7 @@ async function deployContract() {
 
     const contractCreate = await new ContractCreateFlow()
       .setBytecode(bytecode)
-      .setGas(300000)
+      .setGas(3_000_000)
       .setConstructorParameters(new ContractFunctionParameters())
       .execute(client);
 
@@ -101,7 +101,7 @@ async function deployContract() {
 
   } catch (error) {
     console.error('❌ Deployment failed:', error.message);
-    
+
     if (error.message.includes('INSUFFICIENT_GAS')) {
       console.error('\n💡 Increase gas limit in deployment script');
     } else if (error.message.includes('INSUFFICIENT_ACCOUNT_BALANCE')) {
@@ -110,7 +110,7 @@ async function deployContract() {
     } else if (error.message.includes('CONTRACT_BYTECODE_EMPTY')) {
       console.error('\n💡 Bytecode is empty or invalid');
     }
-    
+
     process.exit(1);
   }
 }
@@ -122,22 +122,22 @@ async function verifyContract(client, contractId) {
   try {
     const axios = require('axios');
     const mirrorUrl = `${process.env.MIRROR_NODE_URL}/api/v1/contracts/${contractId.toString()}`;
-    
+
     // Wait for mirror node to index
     await new Promise(resolve => setTimeout(resolve, 5000));
-    
+
     const response = await axios.get(mirrorUrl);
-    
+
     if (response.data && response.data.contract_id) {
       console.log('✅ Contract verified on Mirror Node');
       console.log(`   View at: ${mirrorUrl}\n`);
       return true;
     }
-    
+
   } catch (error) {
     console.log('⚠️  Mirror Node verification pending (may take a few minutes)\n');
   }
-  
+
   return false;
 }
 
