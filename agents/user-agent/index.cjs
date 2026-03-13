@@ -24,6 +24,7 @@ const crypto = require('crypto');
 const fragmentor = require('../../lib/fragmentor.cjs');
 const aiFragmentor = require('../../lib/ai-fragmentor.cjs');
 const DelegationManager = require('../../lib/delegation.cjs');
+const hip1334 = require('../../lib/hip1334.cjs');
 
 // Try to import Ollama dependencies (optional)
 let ChatOllama, createReactAgent;
@@ -845,7 +846,7 @@ Be concise, technical, and privacy-focused in your responses.`;
    */
   async submitProofToPoolManager(proofData) {
     try {
-      // HIP-1340: Approve pool manager to pull this fragment's amount
+      // HIP-1340: Approve pool manager to pull this fragment's HBAR amount
       const poolManagerId = process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID;
       const delegation = new DelegationManager(this.client);
       await delegation.delegateSpendingRights(
@@ -853,11 +854,11 @@ Be concise, technical, and privacy-focused in your responses.`;
         poolManagerId,
         proofData.amount
       );
-      console.log(`   🔑 HIP-1340 allowance approved: ${proofData.amount} HBAR → Pool Manager`);
+      console.log(`   🔑 HIP-1340 allowance: ${proofData.amount} HBAR → Pool Manager`);
 
-      const message = JSON.stringify({
+      const payload = {
         type: 'PROOF_SUBMISSION',
-        proofType: 'shield', // Specify proof type for verification
+        proofType: 'shield',
         submissionId: crypto.randomBytes(16).toString('hex'),
         timestamp: Date.now(),
         proof: proofData.proof,
@@ -866,19 +867,29 @@ Be concise, technical, and privacy-focused in your responses.`;
         nullifierHash: proofData.nullifierHash,
         amount: proofData.amount,
         submitter: this.accountId.toString()
-      });
-      
-      const transaction = new TopicMessageSubmitTransaction()
-        .setTopicId(this.privateTopic)
-        .setMessage(message);
-      
-      await transaction.execute(this.client);
+      };
+
+      // HIP-1334: Send encrypted to Pool Manager's inbox (discovered via Mirror Node)
+      try {
+        await hip1334.sendEncryptedMessage(this.client, poolManagerId, payload);
+        console.log(`   📨 Proof sent via HIP-1334 (encrypted)`);
+      } catch (hip1334Err) {
+        // Fallback: raw HCS private topic if Pool Manager inbox not yet set up
+        console.warn(`   ⚠️  HIP-1334 unavailable (${hip1334Err.message}), using raw HCS`);
+        const transaction = new TopicMessageSubmitTransaction()
+          .setTopicId(this.privateTopic)
+          .setMessage(JSON.stringify(payload));
+        await transaction.execute(this.client);
+        console.log(`   📤 Proof sent via raw HCS (fallback)`);
+      }
+
       return true;
     } catch (error) {
       console.error(`   ❌ Submission failed: ${error.message}`);
       return false;
     }
   }
+
   
   /**
    * Handle proof generation and submission to Pool Manager

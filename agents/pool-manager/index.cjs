@@ -21,6 +21,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const { keccak256 } = require('ethers');
 const DelegationManager = require('../../lib/delegation.cjs');
+const hip1334 = require('../../lib/hip1334.cjs');
 
 class PoolManager {
   constructor() {
@@ -276,63 +277,74 @@ class PoolManager {
   }
   
   /**
-   * Listen for proof submissions on HCS
+   * Initialize HIP-1334 inbox on first start, or load persisted keys.
+   */
+  async initializeHIP1334() {
+    const keysFile = path.join(__dirname, '.hip1334-keys.json');
+    try {
+      const saved = JSON.parse(await fs.readFile(keysFile, 'utf8'));
+      this.hip1334TopicId = saved.topicId;
+      this.hip1334EncPrivKey = saved.encPrivateKey;
+      console.log(`📬 HIP-1334 inbox loaded: ${this.hip1334TopicId}`);
+    } catch {
+      console.log('📬 Creating new HIP-1334 inbox (first run)...');
+      const { topicId, encPrivateKey } = await hip1334.createInbox(
+        this.client,
+        this.accountId.toString(),
+        this.privateKey
+      );
+      this.hip1334TopicId = topicId;
+      this.hip1334EncPrivKey = encPrivateKey;
+      await fs.writeFile(keysFile, JSON.stringify({ topicId, encPrivateKey }, null, 2));
+    }
+  }
+
+  /**
+   * Process a decrypted proof submission payload.
+   */
+  async handleMessage(payload) {
+    if (payload.type !== 'PROOF_SUBMISSION') return;
+    console.log(`📩 [HIP-1334] Proof received: ${payload.submissionId}`);
+    if (!payload.proofType) {
+      console.log('   ⚠️  Missing proofType, skipping');
+      return;
+    }
+    await this.addProofToQueue(payload);
+  }
+
+  /**
+   * Start listening via HIP-1334 encrypted inbox.
+   * Falls back to raw HCS private topic if HIP-1334 init fails.
    */
   async startListening() {
-    console.log('👂 Pool Manager listening for proof submissions...');
-    console.log(`   Private Topic: ${this.privateTopic}`);
-    
-    new TopicMessageQuery()
-      .setTopicId(this.privateTopic)
-      .setStartTime(Math.floor(Date.now() / 1000)) // Only new messages from now on
-      .subscribe(this.client, null, (message) => {
-        try {
-          // HCS message.contents can be base64 encoded or raw bytes
-          let messageString = Buffer.from(message.contents).toString('utf8');
-          
-          // Check if it's base64 encoded (starts with eyJ which is base64 for "{")
-          if (messageString.startsWith('eyJ') || messageString.match(/^[A-Za-z0-9+/=]+$/)) {
-            try {
-              messageString = Buffer.from(messageString, 'base64').toString('utf8');
-            } catch (e) {
-              // Not base64, use as-is
-            }
+    try {
+      await this.initializeHIP1334();
+      console.log('👂 Pool Manager listening via HIP-1334 (encrypted inbox)');
+      console.log(`   Inbox topic: ${this.hip1334TopicId}`);
+      hip1334.listenToInbox(
+        this.client,
+        this.hip1334TopicId,
+        this.hip1334EncPrivKey,
+        (payload) => this.handleMessage(payload)
+      );
+    } catch (err) {
+      console.error('⚠️  HIP-1334 init failed, falling back to raw HCS:', err.message);
+      console.log(`👂 Fallback: raw HCS topic ${this.privateTopic}`);
+      new TopicMessageQuery()
+        .setTopicId(this.privateTopic)
+        .setStartTime(Math.floor(Date.now() / 1000))
+        .subscribe(this.client, null, async (message) => {
+          try {
+            let raw = Buffer.from(message.contents).toString('utf8');
+            if (raw.startsWith('eyJ')) raw = Buffer.from(raw, 'base64').toString('utf8');
+            await this.handleMessage(JSON.parse(raw));
+          } catch (e) {
+            console.error('Error processing HCS message:', e.message);
           }
-          
-          const payload = JSON.parse(messageString);
-          
-          if (payload.type === 'PROOF_SUBMISSION') {
-            console.log(`📩 Received proof submission: ${payload.submissionId}`);
-            
-            // Skip old messages without proofType
-            if (!payload.proofType) {
-              console.log('   ⚠️  Skipping old proof (no proofType field)');
-              return;
-            }
-            
-            this.addProofToQueue(payload);
-          }
-          
-        } catch (error) {
-          console.error('Error processing HCS message:', error.message);
-        }
-      });
+        });
+    }
   }
-  
-  /**
-   * Health check endpoint for monitoring
-   */
-  getStatus() {
-    return {
-      queueSize: this.proofQueue.length,
-      batchScheduled: this.batchScheduled,
-      waitTime: this.firstProofTimestamp 
-        ? Math.floor((Date.now() - this.firstProofTimestamp) / 60000) 
-        : 0,
-      nextBatchIn: this.batchScheduled ? 'Scheduled' : 'Waiting for proofs'
-    };
-  }
-}
+
 
 // Start Pool Manager
 async function main() {
