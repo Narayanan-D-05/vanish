@@ -16,13 +16,15 @@ template Shield(levels) {
     // Private inputs
     signal input secret;
     signal input nullifier;
+    signal input amount;
     signal input pathElements[levels];
     signal input pathIndices[levels];
     
-    // Compute commitment = Poseidon(nullifier, secret)
-    component commitmentHasher = Poseidon(2);
+    // Compute commitment = Poseidon(nullifier, secret, amount)
+    component commitmentHasher = Poseidon(3);
     commitmentHasher.inputs[0] <== nullifier;
     commitmentHasher.inputs[1] <== secret;
+    commitmentHasher.inputs[2] <== amount;
     
     // Verify Merkle proof with Poseidon hashes
     component hashers[levels];
