@@ -12,7 +12,7 @@ const https = require('https');
  */
 
 const CIRCUITS_DIR = path.join(__dirname, 'circuits');
-const PTAU_FILE = 'powersOfTau28_hez_final_15.ptau';
+const PTAU_FILE = 'powersOfTau28_hez_final_21.ptau';
 const PTAU_URL = `https://storage.googleapis.com/zkevm/ptau/${PTAU_FILE}`;
 
 function runCommand(command, cwd = process.cwd()) {
@@ -74,9 +74,9 @@ async function compileCircuit(name) {
   const outputDir = path.join(CIRCUITS_DIR, 'build');
   const includeDir = path.join(__dirname, 'node_modules');
 
-  // Compile with circom2 (output to build subdirectory)
+  // Compile with circom2 (increase memory limit for 1.2M+ constraint circuits)
   await runCommand(
-    `npx circom2 "${inputFile}" --r1cs --wasm --sym -o "${outputDir}" -l "${includeDir}"`,
+    `node --max-old-space-size=8192 node_modules/circom2/cli.js "${inputFile}" --r1cs --wasm --sym -o "${outputDir}" -l "${includeDir}"`,
     __dirname
   );
 

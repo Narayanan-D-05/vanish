@@ -1,6 +1,5 @@
-pragma circom 2.0.0;
-
 include "circomlib/circuits/poseidon.circom";
+include "circomlib/circuits/sha256/sha256.circom";
 include "circomlib/circuits/bitify.circom";
 
 /**
@@ -12,8 +11,9 @@ include "circomlib/circuits/bitify.circom";
  */
 template Withdraw(levels) {
     // Public inputs
-    signal input root;
     signal input nullifierHash;
+    signal input commitment;
+    signal input root[2];
     signal input recipient;
     signal input amount;
     
@@ -23,43 +23,62 @@ template Withdraw(levels) {
     signal input pathElements[levels];
     signal input pathIndices[levels];
     
-    //  Compute commitment = Poseidon(nullifier, secret, amount)
+    // 1. Compute and verify commitment = Poseidon(nullifier, secret, amount)
     component commitmentHasher = Poseidon(3);
     commitmentHasher.inputs[0] <== nullifier;
     commitmentHasher.inputs[1] <== secret;
     commitmentHasher.inputs[2] <== amount;
+    commitment === commitmentHasher.out;
     
-    // Verify Merkle proof with Poseidon hashes
+    // 2. Verify Merkle proof with Sha256 (Hybrid Hashing)
     component hashers[levels];
-    signal hashes[levels + 1];
-    hashes[0] <== commitmentHasher.out;
+    component n2b_path[levels];
+    component n2b_leaf = Num2Bits(256);
+    n2b_leaf.in <== commitmentHasher.out;
     
-    for (var i = 0; i < levels; i++) {
-        hashers[i] = Poseidon(2);
-        
-        // Input selection based on path (quadratic constraints allowed)
-        hashers[i].inputs[0] <== hashes[i] + pathIndices[i] * (pathElements[i] - hashes[i]);
-        hashers[i].inputs[1] <== pathElements[i] + pathIndices[i] * (hashes[i] - pathElements[i]);
-        
-        hashes[i + 1] <== hashers[i].out;
+    signal hashes[levels + 1][256];
+    for (var i = 0; i < 256; i++) {
+        hashes[0][i] <== n2b_leaf.out[i];
     }
     
-    // Verify root matches
-    root === hashes[levels];
+    for (var i = 0; i < levels; i++) {
+        hashers[i] = Sha256(512);
+        n2b_path[i] = Num2Bits(256);
+        n2b_path[i].in <== pathElements[i];
+        
+        for (var k = 0; k < 256; k++) {
+            hashers[i].in[k] <== hashes[i][k] + pathIndices[i] * (n2b_path[i].out[k] - hashes[i][k]);
+            hashers[i].in[k + 256] <== n2b_path[i].out[k] + pathIndices[i] * (hashes[i][k] - n2b_path[i].out[k]);
+        }
+        
+        for (var k = 0; k < 256; k++) {
+            hashes[i + 1][k] <== hashers[i].out[k];
+        }
+    }
     
-    // Compute and verify nullifier hash
+    // 3. Verify root matches
+    component b2n_root_low = Bits2Num(128);
+    component b2n_root_high = Bits2Num(128);
+    for (var k = 0; k < 128; k++) {
+        b2n_root_low.in[k] <== hashes[levels][k];
+        b2n_root_high.in[k] <== hashes[levels][k + 128];
+    }
+    
+    root[0] === b2n_root_low.out;
+    root[1] === b2n_root_high.out;
+    
+    // 4. Compute and verify nullifier hash
     component nullifierHasher = Poseidon(1);
     nullifierHasher.inputs[0] <== nullifier;
     nullifierHash === nullifierHasher.out;
     
-    // Amount constraint (ensure amount is within valid range - 64-bit)
+    // Amount constraint
     component amountCheck = Num2Bits(64);
     amountCheck.in <== amount;
     
-    // Recipient address constraint (Hedera account ID fits in 64-bit)
+    // Recipient address constraint
     component recipientCheck = Num2Bits(64);
     recipientCheck.in <== recipient;
 }
 
-// Instantiate with depth 20 (supports 2^20 = ~1M commitments)
-component main {public [root, nullifierHash, recipient, amount]} = Withdraw(20);
+component main {public [nullifierHash, commitment, root, recipient, amount]} = Withdraw(20);

@@ -152,6 +152,48 @@ async function deployVanishGuard() {
     console.log(`   Denominations: ${denomsTinybars.length > 0 ? denomsTinybars.length + ' locked' : 'unrestricted'}`);
     console.log('═'.repeat(60) + '\n');
 
+    // ── Deploy & Link Verifiers ──────────────────────────────────────────────────
+    async function deployVerifier(name) {
+        const vPath = path.join(__dirname, 'artifacts', 'contracts', `${name}Verifier.sol`, `${name}Verifier.json`);
+        if (!fs.existsSync(vPath)) {
+            console.log(`⚠️  Verifier artifact ${name} not found, skipping.`);
+            return null;
+        }
+        const vArtifact = JSON.parse(fs.readFileSync(vPath, 'utf8'));
+        console.log(`🚀 Deploying ${name}Verifier...`);
+        const vFlow = await new ContractCreateFlow()
+            .setBytecode(vArtifact.bytecode)
+            .setGas(500_000)
+            .execute(client);
+        const vReceipt = await vFlow.getReceipt(client);
+        console.log(`✅ ${name}Verifier deployed at: ${vReceipt.contractId.toString()}`);
+        return vReceipt.contractId;
+    }
+
+    const sV = await deployVerifier('shield');
+    const wV = await deployVerifier('withdraw');
+    const exV = await deployVerifier('exclusion');
+
+    if (sV || wV || exV) {
+        console.log('\n🔗 Linking verifiers to VanishGuard...');
+        const { ContractExecuteTransaction } = require('@hashgraph/sdk');
+        const { Interface } = require('ethers');
+        const vIface = new Interface(['function setVerifiers(address _shield, address _withdraw, address _exclusion)']);
+        // Convert Hedera Contract IDs to EVM addresses (0.0.x -> 0000000000000000000000000000000000000xxx)
+        const toEvm = (id) => id ? '0x' + id.toSolidityAddress() : '0x' + '0'.repeat(40);
+
+        const setLink = await new ContractExecuteTransaction()
+            .setContractId(contractId)
+            .setGas(200_000)
+            .setFunctionParameters(Buffer.from(vIface.encodeFunctionData('setVerifiers', [
+                toEvm(sV), toEvm(wV), toEvm(exV)
+            ]).slice(2), 'hex'))
+            .execute(client);
+        await setLink.getReceipt(client);
+        console.log('✅ Verifiers linked on-chain.\n');
+    }
+
+
     // ── Update .env ──────────────────────────────────────────────────────────────
     try {
         const envPath = '.env';

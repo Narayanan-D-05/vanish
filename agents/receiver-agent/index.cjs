@@ -74,20 +74,19 @@ class ReceiverAgent {
       console.log('   ⚠️  For production, set STEALTH_VIEW_KEY and STEALTH_SPEND_KEY in .env');
     } catch {
       // First run: generate fresh X25519 keypairs for view and spend
+      // Using generateKeyPairSync('x25519') — correct API for Node.js v17+
       console.log('🔑 Generating new stealth keypair (first run)...');
-      const viewEcdh = crypto.createECDH('x25519');
-      viewEcdh.generateKeys();
-      const spendEcdh = crypto.createECDH('x25519');
-      spendEcdh.generateKeys();
+      const { privateKeyHex: viewPrivKey, publicKeyHex: viewPubKey } = hip1334.generateX25519KeyPair();
+      const { privateKeyHex: spendPrivKey, publicKeyHex: spendPubKey } = hip1334.generateX25519KeyPair();
 
-      this.viewPrivateKey = viewEcdh.getPrivateKey('hex');
-      this.spendPrivateKey = spendEcdh.getPrivateKey('hex');
+      this.viewPrivateKey = viewPrivKey;
+      this.spendPrivateKey = spendPrivKey;
 
       await fs.writeFile(keysFile, JSON.stringify({
         viewPrivateKey: this.viewPrivateKey,
         spendPrivateKey: this.spendPrivateKey,
-        viewPublicKey: viewEcdh.getPublicKey('hex'),
-        spendPublicKey: spendEcdh.getPublicKey('hex'),
+        viewPublicKey: viewPubKey,
+        spendPublicKey: spendPubKey,
         generatedAt: new Date().toISOString()
       }, null, 2));
 
@@ -307,7 +306,7 @@ class ReceiverAgent {
 async function main() {
   const agent = new ReceiverAgent();
   await agent.init();  // Load or generate stealth keys securely
-  await agent.startScanning();
+  await agent.startPrivateListening();  // Flaw 1 fix: listen on own encrypted inbox, not public topic
 
   // Status monitoring (every 10 minutes)
   setInterval(() => {
