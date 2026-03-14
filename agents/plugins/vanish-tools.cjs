@@ -71,10 +71,49 @@ const transferHbarTool = new DynamicStructuredTool({
   }),
   func: async ({ toAccountId, amount }) => {
     try {
-      // Gateway Check (simulated for simplicity, real check happens in security-gateway proxy)
       const client = getClient();
       if (!client) throw new Error('Hedera credentials not configured');
 
+      console.log(`\n🛡️ [Security Gateway] Verifying destination ${toAccountId}...`);
+
+      // 1. Resolve EVM Address
+      const axios = require('axios');
+      const { Interface } = require('ethers');
+      const { ContractId, ContractCallQuery } = require('@hashgraph/sdk');
+
+      const mirrorBase = process.env.MIRROR_NODE_URL || 'https://testnet.mirrornode.hedera.com';
+      const evmRes = await axios.get(`${mirrorBase}/api/v1/accounts/${toAccountId}`, { timeout: 10000 });
+      const evmAddress = evmRes.data?.evm_address;
+
+      if (!evmAddress) {
+        throw new Error(`Account ${toAccountId} does not have an EVM address yet (required for AML screening).`);
+      }
+
+      // 2. Query On-Chain OFAC Oracle
+      const abi = ['function isSanctioned(address addr) view returns (bool)'];
+      const iface = new Interface(abi);
+      const calldata = iface.encodeFunctionData('isSanctioned', [evmAddress]);
+      const CHAINALYSIS_ORACLE = '0x40C57923924B5c5c5455c48D93317139ADDaC8fb';
+
+      const oracleQuery = await new ContractCallQuery()
+        .setContractId(ContractId.fromEvmAddress(0, 0, CHAINALYSIS_ORACLE))
+        .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
+        .setGas(50_000)
+        .execute(client);
+
+      const isSanctioned = iface.decodeFunctionResult('isSanctioned', oracleQuery.bytes)[0];
+
+      if (isSanctioned) {
+        console.error(`🚨 [Gateway BLOCKED] Transfer to ${toAccountId} rejected: Address is OFAC sanctioned.`);
+        return JSON.stringify({ 
+          success: false, 
+          error: 'Transfer rejected by Vanish Security Gateway: Destination address is OFAC sanctioned.' 
+        });
+      }
+
+      console.log(`✅ [Gateway APPROVED] ${toAccountId} is clear. Proceeding with transfer...`);
+
+      // 3. Execute Transfer
       const transaction = await new TransferTransaction()
         .addHbarTransfer(client.operatorAccountId, Hbar.from(-amount))
         .addHbarTransfer(AccountId.fromString(toAccountId), Hbar.from(amount))
