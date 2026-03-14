@@ -40,3 +40,9 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Secrets
+agents/pool-manager/.hip1334-keys.json
+
+# Secrets
+agents/pool-manager/.hip1334-keys.json
