@@ -30,7 +30,7 @@ contract VanishMerkleTree {
     error InvalidProof();
     error InvalidCommitment();
     
-    WithdrawVerifier public withdrawVerifier;
+    Groth16Verifier public withdrawVerifier;
 
     /**
      * @dev Constructor initializes the Merkle tree and the verifier
@@ -38,7 +38,7 @@ contract VanishMerkleTree {
     constructor() {
         // Initialize root
         currentRoot = 0;
-        withdrawVerifier = new WithdrawVerifier();
+        withdrawVerifier = new Groth16Verifier();
     }
     
     /**

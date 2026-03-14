@@ -1,3 +1,5 @@
+pragma circom 2.1.6;
+
 include "circomlib/circuits/poseidon.circom";
 include "circomlib/circuits/sha256/sha256.circom";
 include "circomlib/circuits/bitify.circom";
@@ -75,4 +77,5 @@ template Shield(levels) {
     nullifierHash === nullifierHasher.out;
 }
 
-component main {public [nullifierHash, commitment, root]} = Shield(20);
+// Depth 4 for Windows WASM build — use WSL (wsl bash wsl-build.sh) for full depth-20 production build
+component main {public [nullifierHash, commitment, root]} = Shield(4);

@@ -138,7 +138,7 @@ async function deployVanishGuard() {
 
     const contractCreate = await new ContractCreateFlow()
         .setBytecode(fullBytecode)
-        .setGas(1_500_000)   // VanishGuard is heavier than MerkleTree due to array storage
+        .setGas(4_000_000)   // Raised: VanishGuard has complex array storage + policy logic
         .execute(client);
 
     const receipt = await contractCreate.getReceipt(client);
@@ -163,7 +163,7 @@ async function deployVanishGuard() {
         console.log(`🚀 Deploying ${name}Verifier...`);
         const vFlow = await new ContractCreateFlow()
             .setBytecode(vArtifact.bytecode)
-            .setGas(500_000)
+            .setGas(800_000)
             .execute(client);
         const vReceipt = await vFlow.getReceipt(client);
         console.log(`✅ ${name}Verifier deployed at: ${vReceipt.contractId.toString()}`);

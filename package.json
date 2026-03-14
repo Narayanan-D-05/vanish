@@ -45,6 +45,7 @@
     "circomlibjs": "^0.1.7",
     "dotenv": "^16.4.5",
     "ethers": "^6.16.0",
+    "fs-extra": "^11.3.4",
     "hedera-agent-kit": "^3.8.0",
     "js-sha3": "^0.9.3",
     "langchain": "^1.2.30",

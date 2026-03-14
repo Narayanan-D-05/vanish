@@ -1,9 +1,7 @@
 import "@nomicfoundation/hardhat-ethers";
-import dotenv from 'dotenv';
-dotenv.config();
 
 /** @type import('hardhat/config').HardhatUserConfig */
-export default {
+const config = {
   solidity: {
     version: "0.8.20",
     settings: {
@@ -15,8 +13,9 @@ export default {
   },
   paths: {
     sources: "./contracts",
-    tests: "./test",
     cache: "./cache",
     artifacts: "./artifacts"
   }
 };
+
+export default config;
