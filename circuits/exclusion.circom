@@ -1,4 +1,4 @@
-pragma circom 2.0.0;
+pragma circom 2.1.6;
 
 include "circomlib/circuits/poseidon.circom";
 include "circomlib/circuits/sha256/sha256.circom";
@@ -65,7 +65,7 @@ template ExclusionProof(levels, accumulatorLevels) {
             exclusionHashers[i].in[k + 256] <== n2b_path_ex[i].out[k] + exclusionPathIndices[i] * (exclusionHashes[i][k] - n2b_path_ex[i].out[k]);
         }
         for (var k = 0; k < 256; k++) {
-            exclusionHashes[levels+1 === levels+1 ? i + 1 : 0][k] <== exclusionHashers[i].out[k];
+            exclusionHashes[levels+1 == levels+1 ? i + 1 : 0][k] <== exclusionHashers[i].out[k];
         }
     }
 
@@ -136,5 +136,5 @@ template ExclusionProof(levels, accumulatorLevels) {
     accumulatorRoot[1] === b2n_acc_high.out;
 }
 
-// Instantiate: 20 levels for Exclusion Tree, 14 levels for Accumulator (~16k versions)
-component main {public [accumulatorRoot, nullifierHash]} = ExclusionProof(20, 14);
+// Depth 4/4 for Windows WASM build — use WSL (wsl bash wsl-build.sh) for full depth-20/14 production build
+component main {public [accumulatorRoot, nullifierHash]} = ExclusionProof(4, 4);

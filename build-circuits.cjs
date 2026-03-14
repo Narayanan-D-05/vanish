@@ -70,13 +70,23 @@ async function downloadPtau() {
 async function compileCircuit(name) {
   console.log(`\n🔧 Compiling ${name}.circom...`);
 
-  const inputFile = path.join(CIRCUITS_DIR, `${name}.circom`);
-  const outputDir = path.join(CIRCUITS_DIR, 'build');
-  const includeDir = path.join(__dirname, 'node_modules');
+  const inputFile = path.join('circuits', `${name}.circom`);
+  const outputDir = path.join('circuits', 'build');
+  const includeDir = `node_modules`;
+
+  if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  // WASM fs requires forward slashes even on Windows
+  const wasmInput = inputFile.replace(/\\/g, '/');
+  const wasmOutput = outputDir.replace(/\\/g, '/');
+  const wasmInclude = includeDir.replace(/\\/g, '/');
 
   // Compile with circom2 (increase memory limit for 1.2M+ constraint circuits)
+  // Run from the root directory so node_modules resolves correctly
   await runCommand(
-    `node --max-old-space-size=4096 node_modules/circom2/cli.js "${inputFile}" --r1cs --wasm --sym -o "${outputDir}" -l "${includeDir}"`,
+    `node --max-old-space-size=8192 node_modules/circom2/cli.js "${wasmInput}" --r1cs --wasm --sym -o "${wasmOutput}" -l "${wasmInclude}"`,
     __dirname
   );
 
