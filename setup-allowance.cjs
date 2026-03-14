@@ -30,6 +30,7 @@ async function main() {
         console.error('❌ Set HEDERA_ACCOUNT_ID and HEDERA_PRIVATE_KEY in .env');
         process.exit(1);
     }
+
     if (!poolContract) {
         console.error('❌ Set VANISH_GUARD_CONTRACT_ID in .env (the Pool Contract that will spend on your behalf)');
         process.exit(1);

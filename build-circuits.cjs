@@ -76,7 +76,7 @@ async function compileCircuit(name) {
 
   // Compile with circom2 (increase memory limit for 1.2M+ constraint circuits)
   await runCommand(
-    `node --max-old-space-size=8192 node_modules/circom2/cli.js "${inputFile}" --r1cs --wasm --sym -o "${outputDir}" -l "${includeDir}"`,
+    `node --max-old-space-size=4096 node_modules/circom2/cli.js "${inputFile}" --r1cs --wasm --sym -o "${outputDir}" -l "${includeDir}"`,
     __dirname
   );
 
@@ -135,11 +135,11 @@ async function buildCircuits() {
     // Step 1: Download Powers of Tau
     await downloadPtau();
 
-    // Step 2: Compile circuits
+    // Step 2: Compile circuits (smaller ones first)
     const circuitsToBuild = [
-      { name: 'shield', file: 'shield.circom' },
       { name: 'withdraw', file: 'withdraw.circom' },
-      { name: 'exclusion', file: 'exclusion.circom' }
+      { name: 'exclusion', file: 'exclusion.circom' },
+      { name: 'shield', file: 'shield.circom' }
     ];
 
     for (const circuit of circuitsToBuild) {

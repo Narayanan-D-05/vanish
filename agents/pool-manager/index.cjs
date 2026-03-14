@@ -681,23 +681,25 @@ class PoolManager {
   }
 
   async initializeHIP1334() {
-    const keysFile = path.join(__dirname, '.hip1334-keys.json');
-    try {
-      const saved = JSON.parse(await fs.readFile(keysFile, 'utf8'));
-      this.hip1334TopicId = saved.topicId;
-      this.hip1334EncPrivKey = saved.encPrivateKey;
-      console.log(`📬 HIP-1334 inbox loaded: ${this.hip1334TopicId}`);
-    } catch {
-      console.log('📬 Creating new HIP-1334 inbox (first run)...');
-      const { topicId, encPrivateKey } = await hip1334.createInbox(
-        this.client,
-        this.accountId.toString(),
-        this.privateKey
-      );
-      this.hip1334TopicId = topicId;
-      this.hip1334EncPrivKey = encPrivateKey;
-      await fs.writeFile(keysFile, JSON.stringify({ topicId, encPrivateKey }, null, 2));
+    this.hip1334TopicId = process.env.HIP1334_TOPIC_ID;
+    this.hip1334EncPrivKey = process.env.HIP1334_ENC_PRIV_KEY;
+
+    if (this.hip1334TopicId && this.hip1334EncPrivKey) {
+      console.log(`📬 HIP-1334 inbox loaded from .env: ${this.hip1334TopicId}`);
+      return;
     }
+
+    console.log('📬 Creating new HIP-1334 inbox (first run)...');
+    const { topicId, encPrivateKey } = await hip1334.createInbox(
+      this.client,
+      this.accountId.toString(),
+      this.privateKey
+    );
+    this.hip1334TopicId = topicId;
+    this.hip1334EncPrivKey = encPrivateKey;
+    console.log(`🚨 IMPORTANT: Save these to your .env:`);
+    console.log(`HIP1334_TOPIC_ID=${topicId}`);
+    console.log(`HIP1334_ENC_PRIV_KEY=${encPrivateKey}`);
   }
 
   async handleMessage(payload) {
