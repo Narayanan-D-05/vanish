@@ -20,6 +20,7 @@ require('dotenv').config();
 const readline = require('readline');
 const { Client, PrivateKey, AccountId, TopicMessageSubmitTransaction } = require('@hashgraph/sdk');
 const { tools } = require('../plugins/vanish-tools.cjs');
+const { AgentLogger } = require('../plugins/agent-logger.cjs');
 const crypto = require('crypto');
 const fragmentor = require('../../lib/fragmentor.cjs');
 const aiFragmentor = require('../../lib/ai-fragmentor.cjs');
@@ -37,19 +38,25 @@ try {
 
 class UserAgent {
   constructor(useAI = false) {
+    // Agent Logger for reasoning observability
+    this.logger = new AgentLogger({
+      verbose: process.env.AGENT_VERBOSE === 'true',
+      prefix: 'USER_AGENT'
+    });
+
     // Hedera client setup
     this.accountId = AccountId.fromString(process.env.HEDERA_ACCOUNT_ID);
     this.privateKey = PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY);
     this.client = Client.forTestnet();
     this.client.setOperator(this.accountId, this.privateKey);
-    
+
     // HCS topics
     this.privateTopic = process.env.PRIVATE_TOPIC_ID;
     this.publicTopic = process.env.PUBLIC_ANNOUNCEMENT_TOPIC_ID;
-    
+
     // Local user secrets (stored securely on user's device)
     this.userSecrets = new Map();
-    
+
     // Determine mode
     this.aiMode = useAI && ChatOllama && createReactAgent;
     
@@ -279,10 +286,22 @@ class UserAgent {
    */
   async shieldFundsFragmented(amount) {
     console.log(`🎯 Smart Shield: ${amount} HBAR (with fragmentation)\n`);
-    
+
     // Create fragmentation plan
     const plan = fragmentor.createFragmentationPlan(amount);
-    
+
+    // [THOUGHT] Fragmentation Logic: Incorporate logic traces
+    const poolDensity = plan.metrics.anonymitySet > 10 ? 'moderate' : 'low';
+    this.logger.fragmentationReasoning(
+      amount,
+      plan.numFragments,
+      poolDensity,
+      plan.strategy
+    );
+
+    // [THOUGHT] Privacy Scoring: Calculate dynamic Privacy Score and log rationale
+    this.logger.logPrivacyScore(amount, plan.numFragments, plan.metrics);
+
     // Show plan
     console.log(`📊 Fragmentation Plan:`);
     console.log(`   Total: ${plan.totalAmount} HBAR`);
@@ -291,7 +310,7 @@ class UserAgent {
     console.log(`   Privacy Score: ${plan.metrics.privacyScore}%`);
     console.log(`   Cost: $${plan.costs.total.toFixed(4)}`);
     console.log(`   Est. Time: ${plan.metrics.estimatedTime} seconds\n`);
-    
+
     // Generate secrets for all fragments
     const secrets = fragmentor.generateFragmentSecrets(plan.numFragments);
     
@@ -403,7 +422,14 @@ class UserAgent {
     console.log(`\n🧠 AI-Powered Smart Shield: ${amount} HBAR\n`);
     console.log('💭 Agent is thinking about optimal strategy...\n');
     console.log('━'.repeat(60) + '\n');
-    
+
+    // [THOUGHT] Agent initiates reasoning about optimal strategy
+    this.logger.thought(`Analyzing fragmentation strategy for ${amount} HBAR`, {
+      privacyLevel: 'moderate',
+      costSensitive: false,
+      userType: 'regular'
+    });
+
     try {
       // AI analyzes and creates plan
       const plan = await aiFragmentor.analyzeFragmentationStrategy(amount, {
@@ -411,7 +437,24 @@ class UserAgent {
         costSensitive: false,
         userType: 'regular'
       });
-      
+
+      // [LOGIC] AI provides reasoning trace
+      this.logger.logic(`AI Strategy Selection: ${plan.aiStrategy}`, {
+        fragments: plan.numFragments,
+        justification: plan.costJustification,
+        privacyBenefit: plan.privacyBenefit
+      });
+
+      // [THOUGHT] Privacy Scoring with rationale
+      this.logger.logPrivacyScore(amount, plan.numFragments, plan.metrics);
+
+      // [DECISION] Log final decision with rationale
+      this.logger.decision(
+        `Shield ${amount} HBAR using ${plan.numFragments} fragments`,
+        plan.aiPowered ? plan.privacyBenefit : 'Using rule-based fallback',
+        { strategy: plan.aiStrategy || plan.strategy }
+      );
+
       // Display AI reasoning
       if (plan.aiPowered) {
         console.log('🎯 AI Decision:\n');
@@ -422,7 +465,7 @@ class UserAgent {
         console.log(`   Privacy: ${plan.privacyBenefit}`);
         console.log('\n' + '━'.repeat(60) + '\n');
       }
-      
+
       // Generate secrets and proofs
       const secrets = fragmentor.generateFragmentSecrets(plan.numFragments);
       const results = [];

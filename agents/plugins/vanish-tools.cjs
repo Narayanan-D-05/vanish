@@ -17,9 +17,124 @@ const {
 
 /**
  * Vanish Security & Privacy Tools (2026 Production Edition)
- * 
+ *
  * Provides a comprehensive suite of tools for the Vanish User Agent.
  */
+
+/**
+ * PolicyGuard - Safety Guard (Protocol-Level Security)
+ * A hardened layer between the AI's "intent" and the final "execution."
+ */
+class PolicyGuard {
+  constructor() {
+    // Daily transfer limit (can be configured via environment)
+    this.dailyLimit = Number(process.env.DAILY_TRANSFER_LIMIT) || 10000; // Default 10,000 HBAR
+    this.dailyTransfers = new Map(); // Track daily transfers by date
+    this.verbose = process.env.AGENT_VERBOSE === 'true';
+
+    // Restricted addresses (OFAC + Internal)
+    this.restrictedList = new Set([
+      // Add any internal restricted addresses here
+      // Format: account IDs without leading zeros (e.g., "0.0.123456" -> "123456")
+    ]);
+  }
+
+  /**
+   * Verify a transfer request against security policies
+   */
+  async verify(toAccountId, amount, operation = 'transfer') {
+    const checkResults = [];
+
+    // 1. Check daily limit
+    const dailyTotal = this.getDailyTotal();
+    const wouldExceedLimit = dailyTotal + amount > this.dailyLimit;
+
+    if (wouldExceedLimit) {
+      console.log(`\n🚨 [SAFETY_CHECK: BLOCKED] Daily limit would be exceeded`);
+      console.log(`   Current daily total: ${dailyTotal} HBAR`);
+      console.log(`   Requested: ${amount} HBAR`);
+      console.log(`   Daily limit: ${this.dailyLimit} HBAR`);
+      return { passed: false, error: `Transfer would exceed daily limit of ${this.dailyLimit} HBAR` };
+    }
+
+    checkResults.push({ check: 'daily_limit', passed: true, details: { dailyTotal, amount, limit: this.dailyLimit } });
+    console.log(`\n🛡️ [SAFETY_CHECK] Daily limit: ${dailyTotal}/${this.dailyLimit} HBAR ✓`);
+
+    // 2. Check restricted list
+    const normalizedAccountId = toAccountId.replace('0.0.', '');
+    if (this.restrictedList.has(normalizedAccountId)) {
+      console.log(`🚨 [SAFETY_CHECK: BLOCKED] Address on restricted list: ${toAccountId}`);
+      return { passed: false, error: `Transfer to ${toAccountId} denied: address on restricted list` };
+    }
+    checkResults.push({ check: 'restricted_list', passed: true, details: { address: toAccountId } });
+    console.log(`🛡️ [SAFETY_CHECK] Restricted list: ${toAccountId} not on list ✓`);
+
+    // 3. Log safety check passed for HCS/Ledger transactions
+    console.log(`\n✅ [SAFETY_CHECK: PASSED] ${operation} - All security checks passed`);
+    console.log(`   Operation: ${operation}`);
+    console.log(`   Amount: ${amount} HBAR`);
+    console.log(`   Recipient: ${toAccountId}`);
+    console.log(`   Timestamp: ${new Date().toISOString()}`);
+
+    // Track daily transfer
+    this.trackTransfer(amount);
+
+    return { passed: true, checks: checkResults };
+  }
+
+  /**
+   * Get total transfers for today
+   */
+  getDailyTotal() {
+    const today = new Date().toISOString().split('T')[0];
+    const todayTransfers = this.dailyTransfers.get(today) || [];
+    return todayTransfers.reduce((sum, amt) => sum + amt, 0);
+  }
+
+  /**
+   * Track a transfer for daily limit calculation
+   */
+  trackTransfer(amount) {
+    const today = new Date().toISOString().split('T')[0];
+    if (!this.dailyTransfers.has(today)) {
+      this.dailyTransfers.set(today, []);
+    }
+    this.dailyTransfers.get(today).push(amount);
+  }
+
+  /**
+   * Add address to restricted list
+   */
+  addToRestrictedList(accountId) {
+    const normalized = accountId.replace('0.0.', '');
+    this.restrictedList.add(normalized);
+    console.log(`🚨 Added to restricted list: ${accountId}`);
+  }
+
+  /**
+   * Remove address from restricted list
+   */
+  removeFromRestrictedList(accountId) {
+    const normalized = accountId.replace('0.0.', '');
+    this.restrictedList.delete(normalized);
+    console.log(`✅ Removed from restricted list: ${accountId}`);
+  }
+
+  /**
+   * Get current policy status
+   */
+  getStatus() {
+    return {
+      dailyLimit: this.dailyLimit,
+      dailyTotal: this.getDailyTotal(),
+      remaining: this.dailyLimit - this.getDailyTotal(),
+      restrictedCount: this.restrictedList.size
+    };
+  }
+}
+
+// Create global PolicyGuard instance
+const policyGuard = new PolicyGuard();
 
 // Helper to get Hedera Client
 function getClient() {
@@ -60,17 +175,27 @@ const checkBalanceTool = new DynamicStructuredTool({
 });
 
 /**
- * Tool: Transfer HBAR (Policy Enforced)
+ * Tool: Transfer HBAR (Policy Enforced with Safety Guard)
  */
 const transferHbarTool = new DynamicStructuredTool({
   name: 'transfer_hbar',
-  description: 'Transfers HBAR to another account. Note: This tool is restricted by Gateway Policy.',
+  description: 'Transfers HBAR to another account. Note: This tool is restricted by Gateway Policy and Safety Guard.',
   schema: z.object({
     toAccountId: z.string().describe('Recipient account ID'),
     amount: z.number().describe('Amount in HBAR')
   }),
   func: async ({ toAccountId, amount }) => {
     try {
+      // Safety Guard: Verify against policy before execution
+      const safetyCheck = await policyGuard.verify(toAccountId, amount, 'transfer_hbar');
+      if (!safetyCheck.passed) {
+        return JSON.stringify({
+          success: false,
+          error: safetyCheck.error,
+          blockedBy: 'PolicyGuard'
+        });
+      }
+
       const client = getClient();
       if (!client) throw new Error('Hedera credentials not configured');
 
@@ -152,11 +277,11 @@ const requestWhitelistedTransferTool = new DynamicStructuredTool({
 });
 
 /**
- * Tool: Generate ZK-SNARK Shield Proof
+ * Tool: Generate ZK-SNARK Shield Proof (with Safety Guard)
  */
 const generateShieldProofTool = new DynamicStructuredTool({
   name: 'generate_shield_proof',
-  description: 'Generates a ZK-SNARK proof for shielding funds in the Vanish pool.',
+  description: 'Generates a ZK-SNARK proof for shielding funds in the Vanish pool. Subject to Safety Guard policy checks.',
   schema: z.object({
     secret: z.string().describe('32-byte secret'),
     nullifier: z.string().describe('32-byte nullifier'),
@@ -167,6 +292,27 @@ const generateShieldProofTool = new DynamicStructuredTool({
   }),
   func: async ({ secret, nullifier, amount, merkleRoot, merklePathElements, merklePathIndices }) => {
     try {
+      // Safety Guard: Verify amount against policy
+      const dailyTotal = policyGuard.getDailyTotal();
+      const wouldExceedLimit = dailyTotal + amount > policyGuard.dailyLimit;
+
+      if (wouldExceedLimit) {
+        console.log(`\n🚨 [SAFETY_CHECK: BLOCKED] Shield would exceed daily limit`);
+        console.log(`   Current daily total: ${dailyTotal} HBAR`);
+        console.log(`   Requested: ${amount} HBAR`);
+        console.log(`   Daily limit: ${policyGuard.dailyLimit} HBAR`);
+        return JSON.stringify({
+          success: false,
+          error: `Shield would exceed daily limit of ${policyGuard.dailyLimit} HBAR`,
+          blockedBy: 'PolicyGuard'
+        });
+      }
+
+      // Log safety check for shield operation
+      console.log(`\n✅ [SAFETY_CHECK: PASSED] generate_shield_proof`);
+      console.log(`   Amount: ${amount} HBAR`);
+      console.log(`   Daily total: ${dailyTotal + amount}/${policyGuard.dailyLimit} HBAR`);
+
       const poseidon = await buildPoseidon();
       const amountTinybars = BigInt(Math.round(amount * 100000000));
       const secretBigInt = BigInt(secret);
@@ -236,6 +382,8 @@ const generateWithdrawProofTool = new DynamicStructuredTool({
       const rootBigInt = BigInt(merkleRoot);
       const rootLow = rootBigInt & ((1n << 128n) - 1n);
       const rootHigh = rootBigInt >> 128n;
+
+      const commitmentHash = poseidon.F.toString(poseidon([nullifierBigInt, secretBigInt, amountTinybars]));
 
       const input = {
         nullifierHash: nullifierHashComputed,
@@ -318,14 +466,55 @@ const queryPoolStatusTool = new DynamicStructuredTool({
   description: 'Queries the current status of the Vanish pool (Merkle root, queue size, etc.)',
   schema: z.object({}),
   func: async () => {
-    // In production, this would query HCS or a Mirror Node indexer
-    return JSON.stringify({
-      success: true,
-      poolSize: '1.2M HBAR',
-      anonymitySet: 42,
-      lastBatch: Date.now() - 500000,
-      merkleRoot: '0x' + 'a'.repeat(64)
-    });
+    try {
+      const client = getClient();
+      if (!client) throw new Error('Hedera credentials not configured');
+      
+      const guardId = process.env.VANISH_GUARD_CONTRACT_ID;
+      if (!guardId) throw new Error('VANISH_GUARD_CONTRACT_ID not set in .env');
+
+      const { ContractCallQuery, ContractId } = require('@hashgraph/sdk');
+      const { Interface } = require('ethers');
+
+      const abi = [
+        'function currentMerkleRoot() view returns (bytes32)',
+        'function totalDepositsShielded() view returns (uint256)'
+      ];
+      const iface = new Interface(abi);
+
+      // 1. Get Merkle Root
+      const rootCalldata = iface.encodeFunctionData('currentMerkleRoot');
+      const rootQuery = await new ContractCallQuery()
+        .setContractId(ContractId.fromString(guardId))
+        .setFunctionParameters(Buffer.from(rootCalldata.replace('0x', ''), 'hex'))
+        .setGas(50_000)
+        .execute(client);
+      const merkleRoot = iface.decodeFunctionResult('currentMerkleRoot', rootQuery.bytes)[0];
+
+      // 2. Get Anonymity Set Size
+      const setCalldata = iface.encodeFunctionData('totalDepositsShielded');
+      const setQuery = await new ContractCallQuery()
+        .setContractId(ContractId.fromString(guardId))
+        .setFunctionParameters(Buffer.from(setCalldata.replace('0x', ''), 'hex'))
+        .setGas(50_000)
+        .execute(client);
+      const anonymitySet = iface.decodeFunctionResult('totalDepositsShielded', setQuery.bytes)[0];
+
+      // 3. Get Pool Size (HBAR Balance of Contract)
+      const balance = await new AccountBalanceQuery()
+        .setAccountId(AccountId.fromString(guardId))
+        .execute(client);
+
+      return JSON.stringify({
+        success: true,
+        poolSize: balance.hbars.toString() + ' HBAR',
+        anonymitySet: Number(anonymitySet),
+        lastBatch: 'Live',
+        merkleRoot: merkleRoot
+      });
+    } catch (error) {
+       return JSON.stringify({ success: false, error: error.message });
+    }
   }
 });
 
@@ -401,5 +590,7 @@ module.exports = {
   submitProofToPoolTool,
   queryPoolStatusTool,
   generateStealthAddressTool,
-  generateSelectiveDisclosureTool
+  generateSelectiveDisclosureTool,
+  PolicyGuard,
+  policyGuard
 };
