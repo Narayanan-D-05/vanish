@@ -315,8 +315,20 @@ const generateShieldProofTool = new DynamicStructuredTool({
 
       const poseidon = await buildPoseidon();
       const amountTinybars = BigInt(Math.round(amount * 100000000));
-      const secretBigInt = BigInt(secret);
-      const nullifierBigInt = BigInt(nullifier);
+      
+      // Handle hex strings safely (ensure they start with 0x for BigInt parsing if they are hex)
+      const safeBigInt = (val) => {
+        if (typeof val === 'bigint') return val;
+        let str = String(val).trim();
+        if (str.startsWith('0x')) return BigInt(str);
+        // If it looks like hex but missing 0x
+        if (/^[0-9a-fA-F]+$/.test(str) && str.length > 20) return BigInt('0x' + str);
+        // Fallback to integer string
+        return BigInt(str);
+      };
+
+      const secretBigInt = safeBigInt(secret);
+      const nullifierBigInt = safeBigInt(nullifier);
 
       const commitmentHash = poseidon.F.toString(poseidon([nullifierBigInt, secretBigInt, amountTinybars]));
       const nullifierHashComputed = poseidon.F.toString(poseidon([nullifierBigInt]));
@@ -425,20 +437,26 @@ const submitProofToPoolTool = new DynamicStructuredTool({
     proof: z.any().describe('The ZK-SNARK proof object'),
     publicSignals: z.array(z.string()).describe('The ZK-SNARK public signals'),
     proofType: z.enum(['shield', 'withdraw']).describe('Type of proof'),
+    amount: z.number().optional().describe('Amount being transferred (required for policy guard)'),
+    submitter: z.string().optional().describe('Account ID of the submitter'),
     stealthPayload: z.object({}).optional().describe('Optional metadata for stealth identification')
   }),
-  func: async ({ proof, publicSignals, proofType, stealthPayload }) => {
+  func: async ({ proof, publicSignals, proofType, amount, submitter, stealthPayload }) => {
     try {
       const client = getClient();
       if (!client) throw new Error('Hedera credentials not configured');
       const poolManagerId = process.env.POOL_MANAGER_ACCOUNT_ID;
       if (!poolManagerId) throw new Error('POOL_MANAGER_ACCOUNT_ID not set');
 
+      const crypto = require('crypto');
       const message = {
         type: 'PROOF_SUBMISSION',
+        submissionId: crypto.randomBytes(16).toString('hex'),
         proofType,
         proof,
         publicSignals,
+        amount,
+        submitter,
         stealthPayload,
         timestamp: Date.now()
       };
@@ -446,11 +464,12 @@ const submitProofToPoolTool = new DynamicStructuredTool({
       const hip1334 = require('../../lib/hip1334.cjs');
       console.log(`📡 Submitting encrypted ${proofType} proof to Pool Manager (${poolManagerId})...`);
 
-      await hip1334.sendEncryptedMessage(client, poolManagerId, message);
+      const res = await hip1334.sendEncryptedMessage(client, poolManagerId, message);
 
       return JSON.stringify({
         success: true,
-        message: `${proofType} proof submitted successfully via HIP-1334.`
+        message: `${proofType} proof submitted successfully via HIP-1334.`,
+        transactionId: res.transactionId
       });
     } catch (error) {
       return JSON.stringify({ success: false, error: error.message });
@@ -531,20 +550,51 @@ const generateStealthAddressTool = new DynamicStructuredTool({
     amount: z.number().describe('Amount in HBAR')
   }),
   func: async ({ recipientAccountId, recipientViewKey, recipientSpendKey, amount }) => {
-    // (Logic same as previous implementation in Step 1196)
+    const client = getClient();
+    if (!client) throw new Error('Hedera credentials not configured');
+
     const hip1334 = require('../../lib/hip1334.cjs');
     const { privateKeyHex: ephPriv, publicKeyHex: ephPub } = hip1334.generateX25519KeyPair();
+    
+    // Shared Secret (X25519)
     const sharedSecret = hip1334.x25519SharedSecret(ephPriv, recipientViewKey.replace('0x', '')).toString('hex');
-    const stealthAddress = keccak256(Buffer.concat([Buffer.from(sharedSecret, 'hex'), Buffer.from(recipientSpendKey.replace('0x', ''), 'hex')]));
+    
+    // Derive Stealth Address (Ethereum-style)
+    const stealthAddress = keccak256(Buffer.concat([
+      Buffer.from(sharedSecret, 'hex'), 
+      Buffer.from(recipientSpendKey.replace('0x', ''), 'hex')
+    ]));
     const shortAddress = `0x${stealthAddress.slice(2, 42)}`;
 
-    const client = getClient();
-    if (client) {
-      const payload = { type: 'STEALTH_TRANSFER', ephemeralPublicKey: ephPub, amount, stealthAddress: shortAddress, timestamp: Date.now() };
-      await hip1334.sendEncryptedMessage(client, recipientAccountId, payload);
-    }
+    console.log(`📡 [STEALTH] Sending ${amount} HBAR to derived address: ${shortAddress}`);
 
-    return JSON.stringify({ success: true, stealthAddress: shortAddress, ephemeralPublicKey: ephPub });
+    // 1. Send the actual HBAR on-chain to the stealth address
+    const transaction = await new TransferTransaction()
+      .addHbarTransfer(client.operatorAccountId, Hbar.from(-amount))
+      .addHbarTransfer(shortAddress, Hbar.from(amount))
+      .execute(client);
+    
+    const receipt = await transaction.getReceipt(client);
+
+    // 2. Notify recipient via encrypted HCS announcement (so they know to check their keys)
+    const payload = { 
+      type: 'STEALTH_TRANSFER', 
+      ephemeralPublicKey: ephPub, 
+      amount, 
+      stealthAddress: shortAddress, 
+      timestamp: Date.now() 
+    };
+    const res = await hip1334.sendEncryptedMessage(client, recipientAccountId, payload);
+
+    return JSON.stringify({ 
+      success: true, 
+      stealthAddress: shortAddress, 
+      ephemeralPublicKey: ephPub,
+      transferTxId: transaction.transactionId.toString(),
+      notificationTxId: res.transactionId,
+      status: receipt.status.toString(),
+      message: `Successfully sent ${amount} HBAR to stealth address.`
+    });
   }
 });
 
