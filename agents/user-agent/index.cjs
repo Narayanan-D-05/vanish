@@ -322,7 +322,7 @@ class UserAgent {
       }
       // Update blinded view for the AI
       this.blindedVault = this.vault.getBlindedVault(data);
-      this.logger.log('🔐 Vault Decrypted & Blinded: AI Agent cannot see raw secrets.');
+      this.logger.logic('🔐 Vault Decrypted & Blinded: AI Agent cannot see raw secrets.');
     } catch (e) {
       console.error('⚠️ Vault error:', e.message);
       // Migration: If file exists but decrypt fails, might be plaintext
@@ -333,7 +333,7 @@ class UserAgent {
               for (const [key, value] of Object.entries(raw)) {
                 this.userSecrets.set(key, value);
               }
-              this.saveSecrets(); // Re-saves as encrypted
+              this.saveSecrets(); // Re-saves as encrypted and UPDATES blindedVault
           }
       }
     }
