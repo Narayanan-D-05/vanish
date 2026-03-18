@@ -27,6 +27,7 @@ const { keccak256, Wallet } = require('ethers');
 const DelegationManager = require('../../lib/delegation.cjs');
 const hip1334 = require('../../lib/hip1334.cjs');
 const PolicyEngine = require('../../lib/policy-engine.cjs');
+const IncrementalMerkleTree = require('../../lib/merkle-tree.cjs');
 
 let Ollama = null;
 try {
@@ -43,8 +44,8 @@ const normalizeHex = (hex, length = 64) => {
 
 class PoolManager {
   constructor() {
-    this.accountId = AccountId.fromString(process.env.HEDERA_ACCOUNT_ID);
-    this.privateKey = PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY);
+    this.accountId = AccountId.fromString(process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID);
+    this.privateKey = PrivateKey.fromString(process.env.POOL_MANAGER_PRIVATE_KEY || process.env.HEDERA_PRIVATE_KEY);
     this.client = Client.forTestnet();
     this.client.setOperator(this.accountId, this.privateKey);
 
@@ -60,6 +61,9 @@ class PoolManager {
     this.MAX_WAIT_TIME = Number(this.policy.maxWaitMinutes || 2) * 60 * 1000;
     this.MIN_RANDOM_DELAY = Number(this.policy.minDelaySeconds || 1) * 1000; // Demo mode: 1s
     this.MAX_RANDOM_DELAY = Number(this.policy.maxDelaySeconds || 2) * 1000; // Demo mode: 2s
+
+    this.treePath = path.join(__dirname, '../../config/merkle_tree.json');
+    this.merkleTree = new IncrementalMerkleTree(this.treePath, 4);
 
     this.firstProofTimestamp = null;
     this.batchScheduled = false;
@@ -382,9 +386,9 @@ class PoolManager {
       console.warn(`⚠️ [On-Chain Oracle] Failed (${onChainErr.message}).`);
     }
 
-    // ─── TIER 3: Safe fallback ─────────────────────────────────────────────────
-    console.warn(`⚠️ [AML] Both oracle tiers failed for ${accountId}. Returning safe default.`);
-    return 0;
+    // ─── TIER 3: Strict failure (No Fallbacks) ─────────────────────────────────
+    console.warn(`⚠️ [AML] Both oracle tiers failed for ${accountId}. Rejecting to enforce strict compliance.`);
+    throw new Error('Compliance oracles unreachable. Failsafe activated: rejected.');
   }
 
   async addProofToQueue(proofData) {
@@ -649,7 +653,12 @@ class PoolManager {
       // 1. Handle Shields (Update Merkle Root)
       let newMerkleRoot = '0x' + '0'.repeat(64);
       if (shieldProofs.length > 0) {
-        newMerkleRoot = this.computeNewMerkleRoot(shieldProofs);
+        let lastIndex = 0;
+        for (const p of shieldProofs) {
+          lastIndex = this.merkleTree.insert(p.publicSignals[1]); // commitment
+        }
+        const treeState = this.merkleTree.getRootAndPath(lastIndex);
+        newMerkleRoot = treeState.merkleRoot;
         const batchId = Math.random().toString(36).slice(2);
         const batchTimestamp = Date.now();
 
@@ -815,36 +824,7 @@ class PoolManager {
     }
   }
 
-  /**
-   * Compute the new Merkle root using SHA-256 for all intermediate nodes.
-   *
-   * Hybrid Hashing pattern (2026 standard):
-   *  - Leaf = Poseidon(nullifier, secret, amount)  ← stays inside the ZK circuit, never in Solidity
-   *  - Internal nodes = sha256(left ‖ right)       ← uses Hedera's native SHA-256 precompile on-chain
-   *
-   * This keeps Poseidon OUT of Solidity (200k-500k gas per hash) while keeping
-   * it in the ZK circuits where it is cheap (< 200 constraints per hash).
-   */
-  computeNewMerkleRoot(batch) {
-    if (!batch || batch.length === 0) return '0x' + '0'.repeat(64);
-
-    // Leaves are the commitment public signals (already Poseidon-hashed off-chain)
-    let layer = batch.map((p) => Buffer.from(p.publicSignals[1].replace('0x', '').padStart(64, '0'), 'hex'));
-
-    // If odd number of leaves, duplicate the last one (standard Merkle padding)
-    while (layer.length > 1) {
-      if (layer.length % 2 !== 0) layer.push(layer[layer.length - 1]);
-
-      const nextLayer = [];
-      for (let i = 0; i < layer.length; i += 2) {
-        const combined = Buffer.concat([layer[i], layer[i + 1]]);
-        nextLayer.push(crypto.createHash('sha256').update(combined).digest());
-      }
-      layer = nextLayer;
-    }
-
-    return '0x' + layer[0].toString('hex');
-  }
+  /* method computeNewMerkleRoot removed, using IncrementalMerkleTree */
 
   async initializeHIP1334() {
     this.hip1334TopicId = process.env.HIP1334_TOPIC_ID;

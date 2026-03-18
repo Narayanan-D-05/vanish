@@ -13,6 +13,9 @@
 require('dotenv').config();
 const { buildPoseidon } = require('circomlibjs');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const IncrementalMerkleTree = require('./lib/merkle-tree.cjs');
 
 /**
  * Convert a BigInt to LSB-first bit array (matching Num2Bits in circom)
@@ -97,40 +100,25 @@ async function generateTestInputs(options = {}) {
   console.log('🔐 commitment:', commitment.slice(0, 16) + '...');
   console.log('🔐 nullifierHash:', nullifierHash.slice(0, 16) + '...');
 
-  // 2. Convert commitment to LSB-first bits (Num2Bits output)
-  const leafBitsLSB = num2BitsLSB(commitment, 256);
+  // 2. Load the REAL Merkle Tree
+  const treePath = path.join(__dirname, 'config/merkle_tree.json');
+  const tree = new IncrementalMerkleTree(treePath, 4);
 
-  // 3. Zero sibling (Num2Bits(0) = 256 zeros)
-  const zeroBits = Array(256).fill(0);
+  // 3. Find or Insert commitment (fallback for local dev)
+  let cleanCommitment = commitment.startsWith('0x') ? commitment.slice(2) : commitment;
+  cleanCommitment = cleanCommitment.toLowerCase().padStart(64, '0');
 
-  // 4. Build the 4-level tree with commitment at index 0, all siblings = 0
-  // Each level: sha256Bits(current_bits || sibling_bits)
-  // pathIndices = [0,0,0,0] means commitment is always the LEFT child
-  const DEPTH = 4;
-  let currentBits = leafBitsLSB;
-  const pathElements = [];
-  const pathIndics = [];
-
-  for (let i = 0; i < DEPTH; i++) {
-    // left = current, right = zero sibling (index=0 → no swapping)
-    const combined = [...currentBits, ...zeroBits]; // 512 bits
-    currentBits = sha256Bits(combined);
-    pathElements.push('0');   // Sibling = 0
-    pathIndics.push(0);       // Left child
+  let leafIndex = tree.leaves.indexOf(cleanCommitment);
+  if (leafIndex === -1) {
+    console.warn(`⚠️ Commitment not found in real Merkle tree! Local dev fallback: inserting manually.`);
+    leafIndex = tree.insert(cleanCommitment);
   }
 
-  // 5. Derive the root from the final bits
-  const rootBits = currentBits; // 256 bits (output from final SHA256)
-  const rootLowBits = rootBits.slice(0, 128);
-  const rootHighBits = rootBits.slice(128, 256);
-  const rootLow = bitsToNum(rootLowBits).toString();
-  const rootHigh = bitsToNum(rootHighBits).toString();
-  
-  // Reconstruct single big root value for the generate_shield_proof tool
+  // 4. Generate the real path
+  const { merkleRoot, merklePathElements, merklePathIndices, rootLow, rootHigh } = tree.getRootAndPath(leafIndex);
   const rootBigInt = (BigInt(rootHigh) << 128n) | BigInt(rootLow);
 
-  console.log('🌳 Computed Merkle root (low):', rootLow.slice(0, 16) + '...');
-  console.log('🌳 Computed Merkle root (high):', rootHigh.slice(0, 16) + '...');
+  console.log(`🌳 Real Merkle Root: ${merkleRoot.slice(0, 16)}...`);
 
   return {
     secret,
@@ -139,8 +127,8 @@ async function generateTestInputs(options = {}) {
     commitment,
     nullifierHash,
     merkleRoot: rootBigInt.toString(),
-    merklePathElements: pathElements,
-    merklePathIndices: pathIndics,
+    merklePathElements,
+    merklePathIndices,
     recipient,
     rootLow,
     rootHigh
