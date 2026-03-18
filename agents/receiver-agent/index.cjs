@@ -57,44 +57,49 @@ class ReceiverAgent {
   async init() {
     const keysFile = path.join(__dirname, '.stealth-keys.json');
 
-    // Preferred path: dedicated env vars (production)
-    if (process.env.STEALTH_VIEW_KEY && process.env.STEALTH_SPEND_KEY) {
-      this.viewPrivateKey = process.env.STEALTH_VIEW_KEY;
-      this.spendPrivateKey = process.env.STEALTH_SPEND_KEY;
-      console.log('🔑 Stealth keys loaded from environment variables.');
-      return;
-    }
-
-    // Fallback: load from auto-generated file
+    // 1. Try to load from auto-generated file FIRST (it contains both Private AND Public keys)
     try {
       const saved = JSON.parse(await fs.readFile(keysFile, 'utf8'));
       this.viewPrivateKey = saved.viewPrivateKey;
       this.spendPrivateKey = saved.spendPrivateKey;
-      console.log('🔑 Stealth keys loaded from .stealth-keys.json');
-      console.log('   ⚠️  For production, set STEALTH_VIEW_KEY and STEALTH_SPEND_KEY in .env');
-    } catch {
-      // First run: generate fresh X25519 keypairs for view and spend
-      // Using generateKeyPairSync('x25519') — correct API for Node.js v17+
-      console.log('🔑 Generating new stealth keypair (first run)...');
-      const { privateKeyHex: viewPrivKey, publicKeyHex: viewPubKey } = hip1334.generateX25519KeyPair();
-      const { privateKeyHex: spendPrivKey, publicKeyHex: spendPubKey } = hip1334.generateX25519KeyPair();
-
-      this.viewPrivateKey = viewPrivKey;
-      this.spendPrivateKey = spendPrivKey;
-
-      await fs.writeFile(keysFile, JSON.stringify({
-        viewPrivateKey: this.viewPrivateKey,
-        spendPrivateKey: this.spendPrivateKey,
-        viewPublicKey: viewPubKey,
-        spendPublicKey: spendPubKey,
-        generatedAt: new Date().toISOString()
-      }, null, 2));
-
-      console.log('   ✅ Stealth keypair saved to .stealth-keys.json');
-      console.log('   📋 To persist across restarts, add these to .env:');
-      console.log(`   STEALTH_VIEW_KEY=${this.viewPrivateKey}`);
-      console.log(`   STEALTH_SPEND_KEY=${this.spendPrivateKey}`);
+      this.viewPublicKey = saved.viewPublicKey;
+      this.spendPublicKey = saved.spendPublicKey;
+      console.log('🔑 Stealth keys loaded from .stealth-keys.json (contains private keys)');
+      return;
+    } catch (err) {
+      // File not found or invalid, fall back to environment
     }
+
+    // 2. Fallback to dedicated Private Key env vars (if set)
+    if (process.env.STEALTH_VIEW_KEY && process.env.STEALTH_SPEND_KEY) {
+      this.viewPrivateKey = process.env.STEALTH_VIEW_KEY;
+      this.spendPrivateKey = process.env.STEALTH_SPEND_KEY;
+      // Note: In this mode, we don't know the public keys yet, but they can be derived if needed.
+      console.log('🔑 Stealth keys loaded from STEALTH_VIEW_KEY/SPEND_KEY');
+      return;
+    }
+
+    // 3. DO NOT fallback to RECEIVER_VIEW_KEY (it's often the Public Key for the sender)
+    
+    // 4. If nothing found, generate fresh ones
+    console.log('🔑 Generating new stealth keypair (first run)...');
+    const { privateKeyHex: viewPrivKey, publicKeyHex: viewPubKey } = hip1334.generateX25519KeyPair();
+    const { privateKeyHex: spendPrivKey, publicKeyHex: spendPubKey } = hip1334.generateX25519KeyPair();
+
+    this.viewPrivateKey = viewPrivKey;
+    this.spendPrivateKey = spendPrivKey;
+    this.viewPublicKey = viewPubKey;
+    this.spendPublicKey = spendPubKey;
+
+    await fs.writeFile(keysFile, JSON.stringify({
+      viewPrivateKey: this.viewPrivateKey,
+      spendPrivateKey: this.spendPrivateKey,
+      viewPublicKey: viewPubKey,
+      spendPublicKey: spendPubKey,
+      generatedAt: new Date().toISOString()
+    }, null, 2));
+
+    console.log('   ✅ Stealth keypair saved to .stealth-keys.json');
   }
 
   /**
@@ -103,24 +108,40 @@ class ReceiverAgent {
    */
   isMyStealthAddress(ephemeralPublicKey, stealthAddress) {
     try {
-      // Compute shared secret using our view key
-      const sharedSecret = keccak256(
-        Buffer.concat([
-          Buffer.from(this.viewPrivateKey, 'hex'),
-          Buffer.from(ephemeralPublicKey.replace('0x', ''), 'hex')
-        ])
-      );
+      // DEBUG: Log inputs
+      if (process.env.ENABLE_DEBUG === 'true') {
+        console.log(`🔍 [DEBUG] Checking stealth address: ${stealthAddress}`);
+        console.log(`🔍 [DEBUG] viewPrivateKey (first 4): ${this.viewPrivateKey.substring(0, 4)}...`);
+        console.log(`🔍 [DEBUG] ephemeralPublicKey (first 4): ${ephemeralPublicKey.substring(0, 4)}...`);
+      }
 
-      // Derive expected stealth address
+      // 1. Compute shared secret via X25519 DH (Match User Agent logic)
+      const sharedSecret = hip1334.x25519SharedSecret(
+        this.viewPrivateKey.replace('0x', ''), 
+        ephemeralPublicKey.replace('0x', '')
+      ).toString('hex');
+
+      if (process.env.ENABLE_DEBUG === 'true') {
+        console.log(`🔍 [DEBUG] Derived Shared Secret (first 4): ${sharedSecret.substring(0, 4)}...`);
+      }
+
+      // 2. Derive expected stealth address 
+      const spendRef = this.spendPublicKey || process.env.RECEIVER_SPEND_KEY;
+      
       const expectedAddress = keccak256(
         Buffer.concat([
-          Buffer.from(sharedSecret.replace('0x', ''), 'hex'),
-          Buffer.from(this.spendPrivateKey, 'hex')
+          Buffer.from(sharedSecret, 'hex'),
+          Buffer.from((spendRef || '').replace('0x', ''), 'hex')
         ])
       );
 
-      // Compare first 20 bytes (Ethereum-style address)
+      // 3. Compare with the provided stealth address (short version)
       const expectedShort = '0x' + expectedAddress.slice(2, 42);
+
+      if (process.env.ENABLE_DEBUG === 'true') {
+        console.log(`🔍 [DEBUG] Expected Address: ${expectedShort}`);
+        console.log(`🔍 [DEBUG] Received Address: ${stealthAddress}`);
+      }
 
       return expectedShort.toLowerCase() === stealthAddress.toLowerCase();
 
@@ -140,7 +161,7 @@ class ReceiverAgent {
 
     new TopicMessageQuery()
       .setTopicId(this.publicTopic)
-      .setStartTime(Math.floor(Date.now() / 1000)) // Only new messages from now on
+      .setStartTime(Math.floor(Date.now() / 1000) - 30) // Only new messages from now on (30s buffer)
       .subscribe(this.client, null, async (message) => {
         try {
           // HCS message.contents can be base64 encoded or raw bytes
@@ -189,16 +210,17 @@ class ReceiverAgent {
    * Process stealth address announcement
    */
   async processStealthAnnouncement(announcement) {
-    const { ephemeralPublicKey, stealthAddress, amount, token } = announcement;
+    const { ephemeralPublicKey, stealthAddress, amount, token, senderAccountId } = announcement;
 
     // Check if this stealth address is ours
     const isMine = this.isMyStealthAddress(ephemeralPublicKey, stealthAddress);
 
     if (isMine && !this.detectedAddresses.has(stealthAddress)) {
-      console.log('✨ STEALTH TRANSFER DETECTED!');
-      console.log(`   Amount: ${amount} ${token}`);
-      console.log(`   Stealth Address: ${stealthAddress}`);
-      console.log(`   Status: Waiting for batch completion...\n`);
+      console.log('\n✨ STEALTH TRANSFER DETECTED! ✨');
+      console.log(`   Amount: ${amount} ${token || 'HBAR'}`);
+      console.log(`   From:   ${senderAccountId ? senderAccountId + ' (Anonymous via Pool)' : 'Unknown'}`);
+      console.log(`   To:     ${stealthAddress} (Your One-Time Address)`);
+      console.log(`   Status: Waiting for pool batch completion to auto-claim...\n`);
 
       // Track this address
       this.detectedAddresses.add(stealthAddress);
@@ -210,11 +232,12 @@ class ReceiverAgent {
           stealthAddress,
           amount,
           token,
+          senderAccountId,
           ephemeralPublicKey,
           timestamp: Date.now(),
-          message: `Stealth transfer of ${amount} ${token || 'HBAR'} detected. Awaiting batch completion to claim.`
+          message: `Stealth transfer of ${amount} ${token || 'HBAR'} from ${senderAccountId || 'Unknown'} detected. Awaiting batch completion.`
         });
-        console.log(`   📨 Encrypted notification sent to your HCS inbox.\n`);
+        console.log(`   📨 Encrypted notification sent to your personal HCS inbox.\n`);
       } catch (notifErr) {
         console.warn(`   ⚠️ Notification failed (${notifErr.message}) — detection still logged locally.\n`);
       }
@@ -422,14 +445,130 @@ class ReceiverAgent {
 // Start Receiver Agent
 async function main() {
   const agent = new ReceiverAgent();
-  await agent.init();  // Load or generate stealth keys securely
-  await agent.startPrivateListening();  // Flaw 1 fix: listen on own encrypted inbox, not public topic
+  await agent.init();  // Load or generate stealth keys
 
-  // Status monitoring (every 10 minutes)
+  // Listen on PUBLIC HCS topic for pool batch announcements (batch completions trigger claims)
+  agent.startScanning();
+
+  // Also listen on HIP-1334 encrypted inbox for direct STEALTH_TRANSFER messages
+  const inboxTopicId = process.env.RECEIVER_INBOX_TOPIC || process.env.HIP1334_TOPIC_ID;
+  const inboxPrivKey = process.env.HIP1334_ENC_PRIV_KEY;
+
+  if (inboxTopicId && inboxPrivKey) {
+    const hip1334 = require('../../lib/hip1334.cjs');
+    const { Client, PrivateKey, AccountId } = require('@hashgraph/sdk');
+    const client = Client.forTestnet();
+    client.setOperator(
+      AccountId.fromString(process.env.HEDERA_ACCOUNT_ID),
+      PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY)
+    );
+
+    hip1334.listenToInbox(client, inboxTopicId, inboxPrivKey, async (payload) => {
+      if (payload.type === 'STEALTH_TRANSFER') {
+        if (payload.internalSwap) {
+          console.log('\n🔄 [Receiver] Detected INTERNAL SHIELDED SWAP notification!');
+          console.log(`   Amount: ${payload.amount} HBAR`);
+          
+          let senderDisplay = payload.senderAccountId || 'Unknown';
+          
+          // Verify ZK-ID for internal swap
+          if (payload.zkProof && payload.publicSignals) {
+            try {
+              const snarkjs = require('snarkjs');
+              const path = require('path');
+              const fs = require('fs');
+              const vKeyPath = path.join(__dirname, '../../circuits/withdraw_verification_key.json');
+              const vKey = JSON.parse(fs.readFileSync(vKeyPath, 'utf8'));
+              
+              const isValid = await snarkjs.groth16.verify(vKey, payload.publicSignals, payload.zkProof);
+              if (isValid) {
+                senderDisplay += ' (ZK-ID Verified ✅)';
+                
+                // Store the new secret/nullifier so we can spend this commitment later
+                const secretId = `swap_${Date.now()}`;
+                const fsSync = require('fs');
+                const pathSync = require('path');
+                const secretsPath = pathSync.join(__dirname, '../../secrets.json');
+                
+                let secrets = {};
+                if (fsSync.existsSync(secretsPath)) {
+                  secrets = JSON.parse(fsSync.readFileSync(secretsPath, 'utf8'));
+                }
+                
+                secrets[secretId] = {
+                  secret: payload.newSecret,
+                  nullifier: payload.newNullifier,
+                  amount: payload.amount,
+                  used: false,
+                  timestamp: new Date().toISOString(),
+                  source: 'internal_swap',
+                  sender: payload.senderAccountId
+                };
+                
+                fsSync.writeFileSync(secretsPath, JSON.stringify(secrets, null, 2));
+                console.log(`   ✅ Internal swap stored locally. Secret ID: ${secretId}`);
+              } else {
+                senderDisplay += ' (ZK-ID INVALID ❌)';
+              }
+            } catch (err) {
+              senderDisplay += ` (ZK Error: ${err.message})`;
+            }
+          }
+
+          console.log(`   From: ${senderDisplay}`);
+          return;
+        }
+
+        console.log('\n📨 [Receiver] Detected encrypted stealth transfer!');
+        const isMine = agent.isMyStealthAddress(payload.ephemeralPublicKey, payload.stealthAddress);
+        
+        if (isMine) {
+          console.log(`   Stealth Address: ${payload.stealthAddress}`);
+          console.log(`   Amount: ${payload.amount} HBAR`);
+          
+          let senderDisplay = 'Unknown';
+          
+          // ZK-ID Verification (Innovative Hackathon Feature)
+          if (payload.zkProof && payload.publicSignals) {
+            try {
+              const snarkjs = require('snarkjs');
+              const path = require('path');
+              const fs = require('fs');
+              const vKeyPath = path.join(__dirname, '../../circuits/withdraw_verification_key.json');
+              const vKey = JSON.parse(fs.readFileSync(vKeyPath, 'utf8'));
+              
+              console.log(`   🛡️  Verifying sender's ZK-ID proof of ownership...`);
+              const isValid = await snarkjs.groth16.verify(vKey, payload.publicSignals, payload.zkProof);
+              if (isValid) {
+                senderDisplay = `${payload.senderAccountId} (ZK-ID Verified ✅)`;
+              } else {
+                senderDisplay = `${payload.senderAccountId} (ZK-ID INVALID ❌)`;
+              }
+            } catch (err) {
+              senderDisplay = `${payload.senderAccountId} (ZK Error: ${err.message})`;
+            }
+          } else if (payload.senderAccountId) {
+            senderDisplay = `${payload.senderAccountId} (Unverified Hint ⚠️)`;
+          }
+
+          console.log(`   From:   ${senderDisplay}`);
+          console.log('   ✅ Valid stealth transfer for this agent!');
+          agent.detectedAddresses.add(payload.stealthAddress);
+        } else {
+          console.log('   ℹ️  Not addressed to this receiver (different view key).');
+        }
+      }
+    });
+    console.log(`👂 HIP-1334 receiver inbox active: ${inboxTopicId}`);
+  } else {
+    console.log('ℹ️  Set RECEIVER_INBOX_TOPIC + HIP1334_ENC_PRIV_KEY in .env to enable encrypted inbox.');
+  }
+
+  // Status monitoring (every 5 minutes)
   setInterval(() => {
     const status = agent.getStatus();
     console.log('📊 Receiver Status:', status);
-  }, 10 * 60 * 1000);
+  }, 5 * 60 * 1000);
 
   // Keep process alive
   process.on('SIGINT', () => {
