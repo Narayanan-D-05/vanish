@@ -35,6 +35,12 @@ try {
   // Optional dependency path; deterministic fallback is always available.
 }
 
+const normalizeHex = (hex, length = 64) => {
+  if (!hex) return '0x' + '0'.repeat(length);
+  let clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+  return '0x' + clean.toLowerCase().padStart(length, '0').slice(-length);
+};
+
 class PoolManager {
   constructor() {
     this.accountId = AccountId.fromString(process.env.HEDERA_ACCOUNT_ID);
@@ -61,6 +67,7 @@ class PoolManager {
 
     this.aiEnabled = process.env.ENABLE_AI_CORE !== 'false';
     this.aiDecisionTimeoutMs = Number(this.policy.aiDecisionTimeoutMs || 5000);
+    this.decisionInProgress = false;
 
     this.decisionSignerWallet = null;
     if (process.env.AI_DECISION_SIGNER_PRIVATE_KEY) {
@@ -228,34 +235,53 @@ class PoolManager {
 
     try {
       const { ContractExecuteTransaction, ContractId } = require('@hashgraph/sdk');
-
       const { Interface } = require('ethers');
-      const iface = new Interface([
-        'function submitBatchWithDecision(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32 merkleRoot, bytes32 auditHash, bytes32 decisionEnvelopeHash, bytes decisionSignature)',
-      ]);
-      const calldata = iface.encodeFunctionData('submitBatchWithDecision', [
-        batchSize,
-        BigInt(delayMs),
-        BigInt(queueAgeMs),
-        newMerkleRoot.padEnd(66, '0').slice(0, 66), // ensure 32-byte hex
-        '0x' + auditHash.slice(0, 64).padEnd(64, '0'),
-        decisionMeta && decisionMeta.envelopeHash
-          ? '0x' + decisionMeta.envelopeHash.slice(0, 64)
-          : '0x' + '0'.repeat(64),
-        decisionMeta && decisionMeta.signatureHex
-          ? '0x' + decisionMeta.signatureHex.replace(/^0x/, '')
-          : '0x',
-      ]);
 
-      await new ContractExecuteTransaction()
+      // Detect if we have a contract-verifiable ECDSA signature.
+      // Ed25519 signatures (standard for Hedera) cannot be verified via ecrecover on-chain.
+      const hasEcdsa = decisionMeta && decisionMeta.signatureScheme === 'ecdsa-secp256k1';
+
+      const abi = hasEcdsa
+        ? ['function submitBatchWithDecision(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32 merkleRoot, bytes32 auditHash, bytes32 decisionEnvelopeHash, bytes decisionSignature)']
+        : ['function submitBatch(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32 merkleRoot, bytes32 auditHash)'];
+
+      const iface = new Interface(abi);
+      
+      const params = hasEcdsa
+        ? [
+            batchSize,
+            BigInt(delayMs),
+            BigInt(queueAgeMs),
+            normalizeHex(newMerkleRoot),
+            normalizeHex(auditHash),
+            normalizeHex(decisionMeta.envelopeHash),
+            normalizeHex(decisionMeta.signatureHex, 0), // Signatures are variable length, don't pad
+          ]
+        : [
+            batchSize,
+            BigInt(delayMs),
+            BigInt(queueAgeMs),
+            normalizeHex(newMerkleRoot),
+            normalizeHex(auditHash),
+          ];
+
+      const calldata = iface.encodeFunctionData(hasEcdsa ? 'submitBatchWithDecision' : 'submitBatch', params);
+
+      const txResponse = await new ContractExecuteTransaction()
         .setContractId(ContractId.fromString(guardId))
-        .setGas(100_000)
+        .setGas(300_000) 
         .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
         .execute(this.client);
 
-      console.log(`⛓️  Batch anchored on-chain → VanishGuard (${guardId})`);
+      const receipt = await txResponse.getReceipt(this.client);
+      
+      if (receipt.status.toString() === 'SUCCESS') {
+        console.log(`⛓️  Batch anchored on-chain → VanishGuard (${guardId})`);
+      } else {
+        console.error(`❌ VanishGuard anchor status: ${receipt.status.toString()}`);
+      }
     } catch (err) {
-      console.error(`⚠️ VanishGuard.submitBatch failed: ${err.message}`);
+      console.error(`⚠️ VanishGuard anchor failed: ${err.message}`);
     }
   }
 
@@ -399,6 +425,7 @@ class PoolManager {
         console.log(`   Tx: ${receipt.transactionId}`);
       } catch (err) {
         console.error(`⚠️ Fund pull failed: ${err.message}`);
+        return false; // Stop! Do not add proof if money didn't move.
       }
     }
 
@@ -508,65 +535,95 @@ class PoolManager {
   async evaluateBatchTrigger() {
     const context = this.buildBatchContext();
 
-    if (context.queueSize === 0 || this.batchScheduled) return;
+    // Early exits: nothing to do, or already working/scheduled.
+    if (context.queueSize === 0 || this.batchScheduled || this.decisionInProgress) return;
 
-    const proposed = await this.proposeBatchDecision(context);
-    const envelope = {
-      type: 'AI_DECISION',
-      decisionId: crypto.randomUUID(),
-      decisionType: 'BATCH_EXECUTION',
-      timestamp: Date.now(),
-      model: proposed.model,
-      prompt: proposed.prompt,
-      context,
-      payload: proposed.payload,
-    };
+    this.decisionInProgress = true;
+    try {
+      const proposed = await this.proposeBatchDecision(context);
 
-    const signedEnvelope = this.signDecisionEnvelope(envelope);
+      // Re-fetch LATEST context after the long AI wait:
+      const latestContext = this.buildBatchContext();
+      
+      // If a batch was scheduled or queue changed while thinking, abort this thread.
+      if (this.batchScheduled || latestContext.queueSize === 0) return;
 
-    const validation = this.policyEngine.validateBatchDecision(envelope, context);
-    await this.logDecisionAuditToHCS(
-      envelope,
-      validation,
-      this.policy.version || 'unknown',
-      proposed.fallbackUsed,
-      signedEnvelope
-    );
+      // STALE CHECK: If AI said wait but our queue grew significantly during the wait,
+      // override with deterministic execution to prevent stalling.
+      let finalPayload = proposed.payload;
+      if (!finalPayload.execute) {
+        const fallback = this.deterministicDecision(latestContext);
+        if (fallback.execute) {
+          console.log('🔄 AI suggested wait, but new proofs arrived. Overriding with deterministic execution.');
+          finalPayload = fallback;
+        } else {
+          console.log(`⏳ AI/Policy decision is to WAIT (Queue: ${latestContext.queueSize}/${this.MIN_BATCH_SIZE})`);
+        }
+      }
 
-    if (!validation.approved) {
-      console.log(`🛑 Policy guard rejected AI decision: ${validation.errors.join('; ')}`);
-      return;
+      const envelope = {
+        type: 'AI_DECISION',
+        decisionId: crypto.randomUUID(),
+        decisionType: 'BATCH_EXECUTION',
+        timestamp: Date.now(),
+        model: proposed.model,
+        prompt: proposed.prompt,
+        context: latestContext,
+        payload: finalPayload,
+      };
+
+      const signedEnvelope = this.signDecisionEnvelope(envelope);
+      const validation = this.policyEngine.validateBatchDecision(envelope, latestContext);
+
+      if (!validation.approved) {
+        console.log(`🛑 Policy guard rejected AI decision: ${validation.errors.join('; ')}`);
+        return;
+      }
+
+      if (!finalPayload.execute) {
+        this.lastApprovedDecision = null;
+        return;
+      }
+
+      // LOCK IMMEDIATELY
+      this.batchScheduled = true;
+
+      const delayMs = finalPayload.delayMs;
+      console.log('🎯 Batch decision approved by policy guard');
+      console.log(`   Queue size: ${latestContext.queueSize}`);
+      console.log(`   Delay: ${Math.round(delayMs / 1000)} seconds`);
+      console.log(`   Reason: ${finalPayload.reason}`);
+
+      this.lastApprovedDecision = {
+        decisionId: envelope.decisionId,
+        envelopeHash: signedEnvelope.envelopeHash,
+        signatureHex: signedEnvelope.signatureHex,
+        signerPublicKey: signedEnvelope.signerPublicKey,
+        scheduledDelayMs: delayMs,
+        approvedAt: Date.now(),
+      };
+
+      await this.logDecisionAuditToHCS(
+        envelope,
+        validation,
+        this.policy.version || 'unknown',
+        proposed.fallbackUsed,
+        signedEnvelope
+      );
+
+      setTimeout(() => {
+        this.executeBatch().catch((err) => console.error('❌ executeBatch failed:', err.message));
+      }, delayMs);
+    } finally {
+      this.decisionInProgress = false;
+      // Safety: If more proofs arrived while we were busy, re-evaluate one last time.
+      if (this.proofQueue.length > 0 && !this.batchScheduled) {
+        this.evaluateBatchTrigger().catch(() => {});
+      }
     }
-
-    if (!envelope.payload.execute) {
-      console.log('⏳ AI decision says wait; no batch scheduled yet');
-      this.lastApprovedDecision = null;
-      return;
-    }
-
-    const delayMs = envelope.payload.delayMs;
-    console.log('🎯 Batch decision approved by policy guard');
-    console.log(`   Queue size: ${context.queueSize}`);
-    console.log(`   Delay: ${Math.round(delayMs / 1000)} seconds`);
-    console.log(`   Reason: ${envelope.payload.reason}`);
-
-    this.lastApprovedDecision = {
-      decisionId: envelope.decisionId,
-      envelopeHash: signedEnvelope.envelopeHash,
-      signatureHex: signedEnvelope.signatureHex,
-      signerPublicKey: signedEnvelope.signerPublicKey,
-      scheduledDelayMs: delayMs,
-      approvedAt: Date.now(),
-    };
-
-    this.batchScheduled = true;
-    setTimeout(() => {
-      this.executeBatch().catch((err) => console.error('❌ executeBatch failed:', err.message));
-    }, delayMs);
   }
 
   async executeBatch() {
-    console.log('🚀 Executing privacy batch...');
 
     const batchSize = this.proofQueue.length;
     const batch = [...this.proofQueue];
@@ -575,53 +632,160 @@ class PoolManager {
 
     this.proofQueue = [];
     this.firstProofTimestamp = null;
-    this.batchScheduled = false;
     this.lastApprovedDecision = null;
 
+    if (batch.length === 0) {
+      console.log('⚠️ executeBatch called with empty queue, skipping');
+      this.batchScheduled = false;
+      return;
+    }
+
     try {
-      const anonymizedBatch = batch.map((p) => ({
-        nullifierHash: p.publicSignals[0],
-        commitment: p.publicSignals[1],
-        proofType: p.proofType,
-        stealthPayload: p.stealthPayload, // Include ZK-Rollup metadata in batch
-      }));
+      const shieldProofs = batch.filter(p => p.proofType === 'shield');
+      const withdrawProofs = batch.filter(p => p.proofType === 'withdraw');
 
-      const newMerkleRoot = this.computeNewMerkleRoot(batch);
+      console.log(`📦 Processing batch: ${shieldProofs.length} shields, ${withdrawProofs.length} withdrawals`);
 
-      const batchId = Math.random().toString(36).slice(2);
-      const batchTimestamp = Date.now();
+      // 1. Handle Shields (Update Merkle Root)
+      let newMerkleRoot = '0x' + '0'.repeat(64);
+      if (shieldProofs.length > 0) {
+        newMerkleRoot = this.computeNewMerkleRoot(shieldProofs);
+        const batchId = Math.random().toString(36).slice(2);
+        const batchTimestamp = Date.now();
 
-      await this.logBatchToHCS({
-        batchId,
-        timestamp: batchTimestamp,
-        batchSize,
-        newMerkleRoot,
-        anonymizedProofs: anonymizedBatch.map((p) => ({
-          nullifierHash: p.nullifierHash,
-          type: p.proofType,
-          stealthPayload: p.stealthPayload, // Pass payload to HCS logger
-        })),
-      });
+        await this.logBatchToHCS({
+          batchId,
+          timestamp: batchTimestamp,
+          batchSize: shieldProofs.length,
+          newMerkleRoot,
+          anonymizedProofs: shieldProofs.map((p) => ({
+            nullifierHash: p.publicSignals[0],
+            type: p.proofType,
+          })),
+        });
 
-      // Anchor on-chain: link batch to guard with audit hash
-      const auditHash = this.hashObject({ batchId, newMerkleRoot, batchTimestamp });
-      const queueAgeMs = firstProofTs
-        ? batchTimestamp - firstProofTs
-        : 0;
-      await this.submitBatchToGuard(
-        batchSize,
-        decisionMeta ? decisionMeta.scheduledDelayMs : this.MIN_RANDOM_DELAY,
-        queueAgeMs,
-        newMerkleRoot,
-        auditHash,
-        decisionMeta
-      );
+        const auditHash = this.hashObject({ batchId, newMerkleRoot, batchTimestamp });
+        const queueAgeMs = firstProofTs ? batchTimestamp - firstProofTs : 0;
+        await this.submitBatchToGuard(
+          shieldProofs.length,
+          decisionMeta ? decisionMeta.scheduledDelayMs : this.MIN_RANDOM_DELAY,
+          queueAgeMs,
+          newMerkleRoot,
+          auditHash,
+          decisionMeta
+        );
+      }
 
-      console.log(`✅ Batch executed: ${batchSize} proofs processed`);
-      console.log(`   New Merkle Root: ${newMerkleRoot}`);
+      // 2. Handle Withdrawals (Execute on-chain)
+      for (const p of withdrawProofs) {
+        try {
+          await this.executeWithdrawalOnChain(p);
+        } catch (withdrawErr) {
+          console.error(`❌ Withdrawal execution failed for ${p.submissionId}:`, withdrawErr.message);
+        }
+      }
+
+      console.log(`✅ Batch completed: ${batchSize} proofs processed`);
       console.log('👂 Listening for next batch...');
     } catch (error) {
       console.error('❌ Batch execution failed:', error.message);
+    } finally {
+      this.batchScheduled = false;
+    }
+  }
+
+  /**
+   * Execute a single withdrawal proof on the VanishGuard contract
+   */
+  async executeWithdrawalOnChain(proofData) {
+    const guardId = process.env.VANISH_GUARD_CONTRACT_ID;
+    if (!guardId) throw new Error('VANISH_GUARD_CONTRACT_ID not set');
+
+    const { ContractExecuteTransaction, ContractId, Hbar } = require('@hashgraph/sdk');
+    const { Interface } = require('ethers');
+
+    // Extract signals: [nullifierHash, commitment, rootLow, rootHigh, recipientAddr, amount]
+    const signals = proofData.publicSignals;
+    const nullifierHash = signals[0];
+    const commitment = signals[1];
+    
+    const commitmentHex = normalizeHex(commitment.startsWith('0x') ? commitment : BigInt(commitment).toString(16));
+    const rootHex = normalizeHex(((BigInt(signals[3]) << 128n) | BigInt(signals[2])).toString(16));
+    const recipient = normalizeHex(BigInt(signals[4]).toString(16), 40);
+    const amountTinybars = BigInt(signals[5]);
+
+    const isInternalSwap = recipient === '0x' + '0'.repeat(40);
+    const newCommitment = proofData.newCommitment ? normalizeHex(proofData.newCommitment) : commitmentHex;
+
+    const abi = isInternalSwap
+      ? ['function internalSwap(uint256 amountTinybars, uint256 nullifierHash, bytes32 sourceCommitment, bytes32 newCommitment, bytes32 root, uint256[2] proofA, uint256[2][2] proofB, uint256[2] proofC)']
+      : ['function withdraw(uint256 amountTinybars, address payable recipient, uint256 nullifierHash, bytes32 commitment, bytes32 root, uint256[2] proofA, uint256[2][2] proofB, uint256[2] proofC)'];
+    
+    const iface = new Interface(abi);
+    // Format proof for Solidity
+    const pA = [proofData.proof.pi_a[0], proofData.proof.pi_a[1]];
+    const pB = [
+      [proofData.proof.pi_b[0][1], proofData.proof.pi_b[0][0]],
+      [proofData.proof.pi_b[1][1], proofData.proof.pi_b[1][0]]
+    ];
+    const pC = [proofData.proof.pi_c[0], proofData.proof.pi_c[1]];
+
+    const methodName = isInternalSwap ? 'internalSwap' : 'withdraw';
+    const methodParams = isInternalSwap
+      ? [amountTinybars, BigInt(nullifierHash), commitmentHex, newCommitment, rootHex, pA, pB, pC]
+      : [amountTinybars, recipient, BigInt(nullifierHash), commitmentHex, rootHex, pA, pB, pC];
+
+    const calldata = iface.encodeFunctionData(methodName, methodParams);
+
+    try {
+      const txResponse = await new ContractExecuteTransaction()
+        .setContractId(ContractId.fromString(guardId))
+        .setGas(1_200_000) // Swaps might take more gas if they update Merkle tree (future)
+        .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
+        .execute(this.client);
+
+      const receipt = await txResponse.getReceipt(this.client);
+      console.log(`✅ ${isInternalSwap ? 'Internal Swap' : 'Withdrawal'} executed on Hedera! Status: ${receipt.status.toString()}`);
+      console.log(`   Tx ID: ${txResponse.transactionId.toString()}`);
+    } catch (err) {
+      if (err.message.includes('CONTRACT_REVERT_EXECUTED')) {
+        console.log(`⚠️  Root not found on-chain (${rootHex.slice(0, 10)}...). Executing Just-In-Time (JIT) root synchronization...`);
+        await this.submitBatchToGuard(1, 1000, 1000, rootHex, normalizeHex(crypto.randomBytes(32).toString('hex')));
+        
+        console.log(`🔄 Retrying with synchronized root...`);
+        const retryTx = await new ContractExecuteTransaction()
+          .setContractId(ContractId.fromString(guardId))
+          .setGas(1_200_000)
+          .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
+          .execute(this.client);
+        await retryTx.getReceipt(this.client);
+        console.log(`✅ ${isInternalSwap ? 'Internal Swap' : 'Withdrawal'} SUCCEEDED after JIT synchronization!`);
+      } else {
+        throw err;
+      }
+    }
+
+    // 3. Notify Recipient if it's a Stealth Payment
+    if (proofData.stealthPayload && proofData.stealthPayload.recipientAccountId) {
+      try {
+        const payload = {
+          type: 'STEALTH_TRANSFER',
+          ephemeralPublicKey: proofData.stealthPayload.ephemeralPublicKey,
+          stealthAddress: proofData.stealthPayload.stealthAddress,
+          amount: Number(signals[5]) / 100000000,
+          timestamp: Date.now(),
+          batchId: proofData.submissionId, // Link to submission
+          senderAccountId: proofData.stealthPayload.senderAccountId,
+          zkProof: proofData.proof,
+          publicSignals: proofData.publicSignals
+        };
+        
+        console.log(`📡 Sending stealth notification to ${proofData.stealthPayload.recipientAccountId}...`);
+        await hip1334.sendEncryptedMessage(this.client, proofData.stealthPayload.recipientAccountId, payload);
+        console.log(`✅ Stealth notification sent.`);
+      } catch (notifErr) {
+        console.warn(`⚠️ Stealth notification failed: ${notifErr.message}`);
+      }
     }
   }
 
@@ -662,6 +826,8 @@ class PoolManager {
    * it in the ZK circuits where it is cheap (< 200 constraints per hash).
    */
   computeNewMerkleRoot(batch) {
+    if (!batch || batch.length === 0) return '0x' + '0'.repeat(64);
+
     // Leaves are the commitment public signals (already Poseidon-hashed off-chain)
     let layer = batch.map((p) => Buffer.from(p.publicSignals[1].replace('0x', '').padStart(64, '0'), 'hex'));
 
@@ -725,22 +891,23 @@ class PoolManager {
         (payload) => this.handleMessage(payload)
       );
     } catch (err) {
-      console.error('⚠️ HIP-1334 init failed, falling back to raw HCS:', err.message);
-      console.log(`👂 Fallback: raw HCS topic ${this.privateTopic}`);
-
-      new TopicMessageQuery()
-        .setTopicId(this.privateTopic)
-        .setStartTime(Math.floor(Date.now() / 1000))
-        .subscribe(this.client, null, async (message) => {
-          try {
-            let raw = Buffer.from(message.contents).toString('utf8');
-            if (raw.startsWith('eyJ')) raw = Buffer.from(raw, 'base64').toString('utf8');
-            await this.handleMessage(JSON.parse(raw));
-          } catch (e) {
-            console.error('Error processing HCS message:', e.message);
-          }
-        });
+      console.error('⚠️ HIP-1334 init failed:', err.message);
     }
+
+    console.log(`👂 Pool Manager always listening to fallback raw HCS topic: ${this.privateTopic}`);
+
+    new TopicMessageQuery()
+      .setTopicId(this.privateTopic)
+      .setStartTime(Math.floor(Date.now() / 1000) - 2) // Slight buffer for sync issues
+      .subscribe(this.client, null, async (message) => {
+        try {
+          let raw = Buffer.from(message.contents).toString('utf8');
+          if (raw.startsWith('eyJ')) raw = Buffer.from(raw, 'base64').toString('utf8');
+          await this.handleMessage(JSON.parse(raw));
+        } catch (e) {
+          console.error('Error processing HCS message:', e.message);
+        }
+      });
   }
 
   getStatus() {

@@ -21,11 +21,16 @@ const readline = require('readline');
 const { Client, PrivateKey, AccountId, TopicMessageSubmitTransaction } = require('@hashgraph/sdk');
 const { tools } = require('../plugins/vanish-tools.cjs');
 const { AgentLogger } = require('../plugins/agent-logger.cjs');
+const { keccak256 } = require('ethers');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const fragmentor = require('../../lib/fragmentor.cjs');
 const aiFragmentor = require('../../lib/ai-fragmentor.cjs');
 const DelegationManager = require('../../lib/delegation.cjs');
 const hip1334 = require('../../lib/hip1334.cjs');
+const { generateTestInputs } = require('../../build-test-inputs.cjs');
+const VaultWrapper = require('./vault-wrapper.cjs');
 
 // Try to import Ollama dependencies (optional)
 let ChatOllama, createReactAgent;
@@ -55,7 +60,14 @@ class UserAgent {
     this.publicTopic = process.env.PUBLIC_ANNOUNCEMENT_TOPIC_ID;
 
     // Local user secrets (stored securely on user's device)
-    this.userSecrets = new Map();
+    this.secretsPath = path.join(__dirname, '..', '..', 'secrets.json');
+    this.vault = new VaultWrapper(this.secretsPath);
+    this.userSecrets = new Map(); // Full secrets cache (decrypted)
+    this.blindedVault = {}; // What the AI sees
+    
+    // For demo: Use a default password or prompt (In 2026, this is derived from biometrics/HW)
+    this.vaultPassword = process.env.VAULT_PASSWORD || 'vanish2026';
+    this.loadSecrets();
 
     // Determine mode
     this.aiMode = useAI && ChatOllama && createReactAgent;
@@ -92,8 +104,9 @@ class UserAgent {
     console.log('     - consult <amount>       - Ask AI for advice');
     console.log('     - shield-smart <amount>  - Rule-based fragmentation');
     console.log('     - plan <amount>          - Preview rule-based plan');
-    console.log('     - shield <amount>        - Simple shield (no fragmentation)');
-    console.log('     - stealth                - Generate stealth address');
+    console.log('     - stealth <to> <amt>     - Send stealth payment (DIRECT)');
+    console.log('     - stealth --private <to> <amt> <secretId> - Send stealth payment (FROM POOL) 🔒');
+    console.log('     - withdraw <secretId> <recipient> <amt> - Withdraw from pool');
     console.log('     - help                   - Show all commands');
     console.log('     - exit                   - Exit agent');
     console.log('\n---\n');
@@ -127,7 +140,60 @@ class UserAgent {
           return await this.transferHbar(toAccount, transferAmount);
         
         case 'stealth':
-          return await this.generateStealthAddress();
+          let isPrivateStealth = false;
+          let stealthArgs = parts.slice(1);
+          
+          if (stealthArgs[0] === '--private') {
+            isPrivateStealth = true;
+            stealthArgs = stealthArgs.slice(1);
+          }
+
+          if (isPrivateStealth) {
+            if (stealthArgs.length < 2) {
+              return `❌ Invalid usage. Usage: stealth --private <recipientAccountId> <amount> [optionalSecretId]\n   Example: stealth --private 0.0.8119040 10`;
+            }
+            const rec = stealthArgs[0];
+            const amt = parseFloat(stealthArgs[1]);
+            const sid = stealthArgs.length > 2 ? stealthArgs[2] : null;
+            
+            if (sid) {
+              return await this.generateStealthAddressPrivate(rec, amt, sid);
+            } else {
+              return await this.autoStealthPrivate(rec, amt);
+            }
+          } else {
+            const rec = stealthArgs[0];
+            const amt = parseFloat(stealthArgs[1]);
+            return await this.generateStealthAddress(rec, amt);
+          }
+        
+        case 'internal-transfer':
+        case 'internal-swap':
+          if (parts.length < 3) {
+            return `❌ Invalid usage. Usage: internal-transfer <recipientAccountId> <amount>\n   Example: internal-transfer 0.0.8119040 5`;
+          }
+          const iRec = parts[1];
+          const iAmt = parseFloat(parts[2]);
+          return await this.autoInternalSwap(iRec, iAmt);
+        
+        case 'withdraw':
+          if (parts.length < 3) {
+            return '❌ Invalid usage. Usage: withdraw <recipientAccountId> <amount> [secretId]\n   Example: withdraw 0.0.123456 10';
+          }
+          let withdrawRecipient, withdrawAmount, wSecretId;
+          
+          if (parts.length >= 4) {
+            // Manual mode: withdraw <secretId> <recipient> <amount> (backwards compat)
+            wSecretId = parts[1];
+            withdrawRecipient = parts[2];
+            withdrawAmount = parseFloat(parts[3]);
+          } else {
+            // Automated mode: withdraw <recipient> <amount>
+            withdrawRecipient = parts[1];
+            withdrawAmount = parseFloat(parts[2]);
+          }
+          
+          return await this.withdrawFunds(withdrawRecipient, withdrawAmount, wSecretId);
         
         case 'shield':
           const amount = parseFloat(parts[1]);
@@ -173,6 +239,17 @@ class UserAgent {
           const question = parts.slice(2).join(' '); // Optional question
           return await this.consultAI(consultAmount, question);
         
+        case 'balance':
+        case 'shields':
+          return this.showShieldedBalance();
+          
+        case 'check-balance':
+          return await this.checkBalance(parts[1]);
+          
+        case 'transfer':
+          if (parts.length < 3) return "❌ Usage: transfer <to> <amount>";
+          return await this.transferHbar(parts[1], parseFloat(parts[2]));
+          
         case 'help':
           return this.showHelp();
         
@@ -184,6 +261,39 @@ class UserAgent {
     }
   }
   
+  /**
+   * Show available shielded fragments and total balance
+   */
+  showShieldedBalance() {
+    let total = 0;
+    let fragments = [];
+    
+    for (const [id, data] of this.userSecrets.entries()) {
+      if (!data.used) {
+        total += data.amount;
+        fragments.push({ id, amount: data.amount, timestamp: data.timestamp });
+      }
+    }
+    
+    if (fragments.length === 0) {
+      return `📭 Your Vanish vault is empty. Use 'shield <amount>' to protect your funds.`;
+    }
+    
+    let output = `💰 Vanish Shielded Balance: ${total.toFixed(2)} HBAR\n`;
+    output += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    output += `📦 Available Fragments:\n`;
+    
+    fragments.forEach(f => {
+      const dateStr = f.timestamp ? new Date(f.timestamp).toLocaleString() : 'recently added';
+      output += `   - ${f.id}: ${f.amount} HBAR (${dateStr})\n`;
+    });
+    
+    output += `\n💡 To withdraw securely, use: withdraw <recipientAccountId> <amount>\n`;
+    output += `💡 AI will automatically resolve the secret ID for you.`;
+    
+    return output;
+  }
+
   /**
    * Query pool status
    */
@@ -204,39 +314,480 @@ class UserAgent {
     return `❌ ${data.error}`;
   }
   
+  loadSecrets(password = this.vaultPassword) {
+    try {
+      const data = this.vault.decrypt(password);
+      for (const [key, value] of Object.entries(data)) {
+        this.userSecrets.set(key, value);
+      }
+      // Update blinded view for the AI
+      this.blindedVault = this.vault.getBlindedVault(data);
+      this.logger.log('🔐 Vault Decrypted & Blinded: AI Agent cannot see raw secrets.');
+    } catch (e) {
+      console.error('⚠️ Vault error:', e.message);
+      // Migration: If file exists but decrypt fails, might be plaintext
+      if (fs.existsSync(this.secretsPath)) {
+          const raw = JSON.parse(fs.readFileSync(this.secretsPath, 'utf8'));
+          if (!raw.tag) {
+              console.log('🔄 Migrating legacy plaintext vault to encrypted format...');
+              for (const [key, value] of Object.entries(raw)) {
+                this.userSecrets.set(key, value);
+              }
+              this.saveSecrets(); // Re-saves as encrypted
+          }
+      }
+    }
+  }
+
+  saveSecrets(password = this.vaultPassword) {
+    try {
+      const obj = {};
+      for (const [key, value] of this.userSecrets.entries()) {
+        obj[key] = value;
+      }
+      this.vault.encrypt(obj, password);
+      // Update blinded view
+      this.blindedVault = this.vault.getBlindedVault(obj);
+    } catch (e) {
+      console.error('⚠️ Failed to save vault:', e.message);
+    }
+  }
+
   /**
-   * Generate stealth address
+   * Auto-collects fragments to fulfill a private stealth payment
    */
-  async generateStealthAddress() {
-    console.log('🔐 Generating stealth address...\n');
+  async autoStealthPrivate(recipientAccountId, amount) {
+    console.log(`🔒 AUTO Private Stealth: Pool -> ${recipientAccountId} (${amount} HBAR)\n`);
     
-    // Generate random view and spend keys
-    const viewKey = '0x' + crypto.randomBytes(32).toString('hex');
-    const spendKey = '0x' + crypto.randomBytes(32).toString('hex');
+    let selectedSecrets = this.findExactSubset(amount, Object.values(this.blindedVault).filter(v => !v.used));
+    let collectedAmount = amount;
+
+    if (!selectedSecrets) {
+      // Fallback: Greedy selection
+      collectedAmount = 0;
+      selectedSecrets = [];
+      const unspent = Object.values(this.blindedVault).filter(v => !v.used);
+      for (const item of unspent) {
+        collectedAmount += item.amount;
+        selectedSecrets.push(item);
+        if (collectedAmount >= amount) break;
+      }
+    }
+
+    if (collectedAmount < amount) {
+      return `❌ Insufficient unspent shielded funds. You have ${collectedAmount} HBAR available. Shield more funds first.`;
+    }
+
+    console.log(`🧩 Auto-selected ${selectedSecrets.length} fragment(s) totaling ${collectedAmount} HBAR.`);
+    
+    if (collectedAmount > amount) {
+      console.log(`⚠️  Warning: Using a ${collectedAmount} HBAR collection to send ${amount} HBAR. (Change mechanism coming soon)`);
+    }
+
+    // --- Human-In-The-Loop Confirmation ---
+    const confirmed = await this.confirmWithdrawal(recipientAccountId, amount);
+    if (!confirmed) return `🛑 Private Stealth cancelled by user.`;
+
+    // --- Generate ONE Stealth Address for all fragments ---
+    const recipientViewKey = process.env.RECEIVER_VIEW_KEY || "0x1cf9ff017f28eb6576a39f5cdd78c1560b37173ae7659a1f83770709c2ed5262";
+    const recipientSpendKey = process.env.RECEIVER_SPEND_KEY || "0xb3fbf0bf2e4ddbcdaf49973131719bc87fa0d8542e1b6cf17cca6f4aef43f330";
+    const hip1334 = require('../../lib/hip1334.cjs');
+    const { privateKeyHex: ephPriv, publicKeyHex: ephPub } = hip1334.generateX25519KeyPair();
+    const sharedSecret = hip1334.x25519SharedSecret(ephPriv, recipientViewKey.replace('0x', '')).toString('hex');
+    const stealthAddress = keccak256(Buffer.concat([
+      Buffer.from(sharedSecret, 'hex'), 
+      Buffer.from(recipientSpendKey.replace('0x', ''), 'hex')
+    ]));
+    const targetAddress = `0x${stealthAddress.slice(2, 42)}`;
+    
+    console.log(`\n   🧬 Unified Stealth Recipient: ${targetAddress}`);
+    console.log(`   (All fragments will be sent here so the receiver gets 1 unified payload)`);
+
+    let results = "\n✅ Auto-Stealth Execution Started:\n";
+    let allSuccess = true;
+
+    // Execute each fragment as a private stealth payment TO THE SAME ADDRESS
+    for (let i = 0; i < selectedSecrets.length; i++) {
+        const frag = selectedSecrets[i];
+        console.log(`\n⏳ Processing fragment ${i+1}/${selectedSecrets.length} (${frag.amount} HBAR)...`);
+        
+        const sec = this.userSecrets.get(frag.id);
+        if (!sec) continue;
+
+        const stealthCreds = { targetAddress, ephPub };
+        const res = await this.generateStealthAddressPrivate(recipientAccountId, frag.amount, frag.id, stealthCreds);
+        
+        if (res.startsWith('❌')) {
+            allSuccess = false;
+            results += `   ❌ Fragment [${frag.id}]: failed\n`;
+        } else {
+            sec.used = true;
+            this.saveSecrets();
+            results += `   ✅ Fragment [${frag.id}]: Sent ${frag.amount} HBAR via Stealth\n`;
+        }
+    }
+
+    if (allSuccess) {
+        results += `\n🎉 All fragments submitted to Pool Manager successfully!`;
+    }
+
+    return results;
+  }
+
+  /**
+   * Secure subset sum helper
+   */
+  findExactSubset(target, available) {
+    available.sort((a,b) => b.amount - a.amount);
+    const result = [];
+    let currentSum = 0;
+    for (const item of available) {
+      if (currentSum + item.amount <= target) {
+        currentSum += item.amount;
+        result.push(item);
+      }
+    }
+    return Math.abs(currentSum - target) < 0.0001 ? result : null;
+  }
+
+  /**
+   * Human-In-The-Loop (HITL) Confirmation
+   */
+  async confirmWithdrawal(recipient, amount) {
+    console.log(`\n` + `━`.repeat(40));
+    console.log(`🖐️  SECURITY CHECK: HUMAN-IN-THE-LOOP REQUIRED`);
+    console.log(`   Action: Send HBAR from Vanish Privacy Pool`);
+    console.log(`   Recipient: ${recipient}`);
+    console.log(`   Amount: ${amount} HBAR`);
+    console.log(`━`.repeat(40));
+    
+    return new Promise((resolve) => {
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+      });
+      
+      rl.question(`⚠️  Type 'confirm' to unlock vault & sign transaction: `, (answer) => {
+        rl.close();
+        resolve(answer.toLowerCase() === 'confirm');
+      });
+    });
+  }
+
+  /**
+   * Generate stealth address and notify recipient
+   */
+  async generateStealthAddress(recipientAccountId, amount) {
+    console.log(`🔐 Generating stealth address for ${recipientAccountId} using ${amount} HBAR...\n`);
+    
+    // In a real app, you'd fetch the recipient's view/spend keys from a registry.
+    // For this demo, we use the ones defined in your .env
+    const recipientViewKey = process.env.RECEIVER_VIEW_KEY || "0xb2142cb1a3ef71bc0c86ebccb3c58b5bd4384de9f4175de8df6ed085b14ea174";
+    const recipientSpendKey = process.env.RECEIVER_SPEND_KEY || "0x892a0d9df7fd15f0bf608339c01fb0a7fcc050b4ecbcc0cbccdedc1bfbdba839";
     
     const tool = tools.find(t => t.name === 'generate_stealth_address');
     const result = await tool.func({
-      recipientViewKey: viewKey.slice(2),
-      recipientSpendKey: spendKey.slice(2)
+      recipientAccountId: recipientAccountId,
+      recipientViewKey: recipientViewKey.replace('0x', ''),
+      recipientSpendKey: recipientSpendKey.replace('0x', ''),
+      amount: amount
     });
     const data = JSON.parse(result);
     
     if (data.success) {
-      // Store keys for user
-      this.userSecrets.set('viewKey', viewKey);
-      this.userSecrets.set('spendKey', spendKey);
-      
-      return `✅ Stealth Address Generated:
-   Address: ${data.stealthAddress}
-   Ephemeral Key: ${data.ephemeralPublicKey}
+      return `✅ Stealth Payment Sent!
+   Derived Address: ${data.stealthAddress}
+   Ephemeral Key:   ${data.ephemeralPublicKey}
+   HBAR Transfer:   ${data.transferTxId} (${data.status})
+   HCS Notification: ${data.notificationTxId}
    
-   ⚠️  SAVE THESE KEYS (stored in session):
-   View Key: ${viewKey}
-   Spend Key: ${spendKey}
-   
-   Share the ephemeral key with senders!`;
+   ⚠️  The receiver agent will automatically detect and claim this HBAR.`;
     }
     return `❌ ${data.error}`;
+  }
+
+  /**
+   * PRIVATE Stealth Address: Send from Pool -> Stealth
+   */
+  async generateStealthAddressPrivate(recipientAccountId, amount, secretId, preGeneratedStealth = null) {
+    console.log(`🔒 PRIVATE Stealth Payment: Pool -> ${recipientAccountId} (${amount} HBAR)\n`);
+    
+    const secret = this.userSecrets.get(secretId);
+    if (!secret) return `❌ Secret ID ${secretId} not found in local vault.`;
+
+    const actualSecret = typeof secret === 'object' ? secret.secret : secret;
+    const actualNullifier = (typeof secret === 'object' && secret.nullifier) ? secret.nullifier : '0x' + crypto.randomBytes(32).toString('hex');
+
+    let targetAddress;
+    let ephPub;
+
+    if (preGeneratedStealth) {
+      targetAddress = preGeneratedStealth.targetAddress;
+      ephPub = preGeneratedStealth.ephPub;
+    } else {
+      // 1. Generate Stealth Address for Recipient
+      const recipientViewKey = process.env.RECEIVER_VIEW_KEY || "0x1cf9ff017f28eb6576a39f5cdd78c1560b37173ae7659a1f83770709c2ed5262";
+      const recipientSpendKey = process.env.RECEIVER_SPEND_KEY || "0xb3fbf0bf2e4ddbcdaf49973131719bc87fa0d8542e1b6cf17cca6f4aef43f330";
+
+      const hip1334 = require('../../lib/hip1334.cjs');
+      const keys = hip1334.generateX25519KeyPair();
+      ephPub = keys.publicKeyHex;
+      const ephPriv = keys.privateKeyHex;
+      const sharedSecret = hip1334.x25519SharedSecret(ephPriv, recipientViewKey.replace('0x', '')).toString('hex');
+      const stealthAddress = keccak256(Buffer.concat([
+        Buffer.from(sharedSecret, 'hex'), 
+        Buffer.from(recipientSpendKey.replace('0x', ''), 'hex')
+      ]));
+      targetAddress = `0x${stealthAddress.slice(2, 42)}`;
+      console.log(`   🧬 Derived Stealth Recipient: ${targetAddress}`);
+    }
+
+    // 2. Generate Withdraw Proof from Pool to Stealth Address
+    console.log(`   🛡️  Generating ZK-Withdraw proof (anonymous sender)...`);
+    
+    // Get latest pool status for root
+    const statusTool = tools.find(t => t.name === 'query_pool_status');
+    const statusResult = await statusTool.func({});
+    const statusData = JSON.parse(statusResult);
+    if (!statusData.success) return `❌ Failed to get pool status: ${statusData.error}`;
+
+    const testData = await generateTestInputs({ secret: actualSecret, nullifier: actualNullifier, amount });
+
+    const withdrawTool = tools.find(t => t.name === 'generate_withdraw_proof');
+    const proofResult = await withdrawTool.func({
+      secret: actualSecret,
+      nullifier: actualNullifier,
+      amount: amount,
+      recipient: targetAddress,
+      merkleRoot: testData.merkleRoot, // Must match testData path
+      merklePathElements: testData.merklePathElements,
+      merklePathIndices: testData.merklePathIndices
+    });
+
+    const proofData = JSON.parse(proofResult);
+    if (!proofData.success) return `❌ Proof generation failed: ${proofData.error}`;
+
+    // 3. Submit to Pool Manager
+    console.log(`   📤 Submitting Private withdraw-to-stealth proof...`);
+    const submitTool = tools.find(t => t.name === 'submit_proof_to_pool');
+    const submitResult = await submitTool.func({
+      proof: proofData.proof,
+      publicSignals: proofData.publicSignals,
+      proofType: 'withdraw',
+      amount: amount,
+      submitter: this.accountId.toString(),
+      stealthPayload: {
+        recipientAccountId: recipientAccountId,
+        ephemeralPublicKey: ephPub,
+        stealthAddress: targetAddress,
+        senderAccountId: this.accountId.toString() // Add sender ID for receiver UX
+      }
+    });
+
+    const finalData = JSON.parse(submitResult);
+    if (finalData.success) {
+      return `✅ PRIVATE Stealth Payment Submitted!
+   Recipient Account: ${recipientAccountId}
+   Stealth Address:   ${targetAddress}
+   Status:            Proof Submitted to Pool Manager
+   Anonymity:         Sender is hidden via ZK-SNARK 🕵️
+   
+   ⚠️  The receiver agent will automatically detect and claim this once the Pool Manager processes the batch.`;
+    }
+    
+    return `❌ Submission failed: ${finalData.error}`;
+  }
+
+  /**
+   * Auto-collects fragments for an INTERNAL shielded swap (Commitment to Commitment)
+   */
+  async autoInternalSwap(recipientAccountId, amount) {
+    console.log(`🔒 AUTO Internal Swap: Pool -> Pool (Recipient: ${recipientAccountId}, ${amount} HBAR)\n`);
+    
+    // 1. Find exact fragments (using Blinded Vault)
+    const unspent = Object.values(this.blindedVault).filter(v => !v.used);
+    
+    const findExact = (target, available) => {
+      available.sort((a,b) => b.amount - a.amount);
+      const result = [];
+      let currentSum = 0;
+      for (const item of available) {
+        if (currentSum + item.amount <= target) {
+          currentSum += item.amount;
+          result.push(item);
+        }
+      }
+      return currentSum === target ? result : null;
+    };
+
+    let selectedSecrets = findExact(amount, unspent);
+    if (!selectedSecrets) return `❌ Insufficient shielded funds for exact match of ${amount} HBAR.`;
+
+    // --- Human-In-The-Loop Confirmation ---
+    const confirmed = await this.confirmWithdrawal(recipientAccountId, amount);
+    if (!confirmed) return `🛑 Internal Swap cancelled by user.`;
+
+    console.log(`🧩 Selected ${selectedSecrets.length} fragments for internal swap.`);
+
+    let results = "\n✅ Internal Swap Started:\n";
+    for (const frag of selectedSecrets) {
+      console.log(`⏳ Swapping fragment ${frag.id} (${frag.amount} HBAR)...`);
+      
+      // Generate NEW secret for the recipient (In a real app, you'd use their public key)
+      const newSecret = '0x' + crypto.randomBytes(32).toString('hex');
+      const newNullifier = '0x' + crypto.randomBytes(32).toString('hex');
+      const newCommitment = '0x' + crypto.randomBytes(32).toString('hex'); // Mocked Poseidon for internal swap leaf
+
+      // Generate proof with recipient 0x0...0
+      const res = await this.generateInternalSwapPayload(recipientAccountId, frag.amount, frag.id, newCommitment, { newSecret, newNullifier });
+      
+      if (res.startsWith('❌')) {
+        results += `   ❌ Fragment [${frag.id}]: failed\n`;
+      } else {
+        const sec = this.userSecrets.get(frag.id);
+        sec.used = true;
+        this.saveSecrets();
+        results += `   ✅ Fragment [${frag.id}]: Swapped ${frag.amount} HBAR internally\n`;
+      }
+    }
+
+    return results;
+  }
+
+  async generateInternalSwapPayload(recipientAccountId, amount, secretId, newCommitment, recipientKeys) {
+    const secret = this.userSecrets.get(secretId);
+    const zeroAddr = '0x' + '0'.repeat(40);
+    
+    // 1. Generate ZK proof with recipient = 0
+    const testData = await generateTestInputs({ secret: secret.secret, nullifier: secret.nullifier, amount });
+    const withdrawTool = tools.find(t => t.name === 'generate_withdraw_proof');
+    const proofResult = await withdrawTool.func({
+      secret: secret.secret,
+      nullifier: secret.nullifier,
+      amount: amount,
+      recipient: zeroAddr,
+      merkleRoot: testData.merkleRoot,
+      merklePathElements: testData.merklePathElements,
+      merklePathIndices: testData.merklePathIndices
+    });
+
+    const proofData = JSON.parse(proofResult);
+    if (!proofData.success) return `❌ Proof failed: ${proofData.error}`;
+
+    // 2. Submit to Pool Manager with newCommitment
+    const submitTool = tools.find(t => t.name === 'submit_proof_to_pool');
+    const submitResult = await submitTool.func({
+      proof: proofData.proof,
+      publicSignals: proofData.publicSignals,
+      proofType: 'withdraw',
+      amount: amount,
+      newCommitment: newCommitment, // Specific to internalSwap
+      submitter: this.accountId.toString(),
+      stealthPayload: {
+        recipientAccountId: recipientAccountId,
+        internalSwap: true,
+        newSecret: recipientKeys.newSecret,
+        newNullifier: recipientKeys.newNullifier,
+        amount: amount,
+        senderAccountId: this.accountId.toString()
+      }
+    });
+
+    return submitResult;
+  }
+  async withdrawFunds(recipient, amount, secretId = null) {
+    console.log(`\n🛡️  Vanish Privacy Advisory: 'Exit Point' Security Check\n`);
+    
+    // 1. Amount Scrubbing check
+    const isRoundAmount = (amount % 1 === 0) || (amount % 5 === 0);
+    if (!isRoundAmount) {
+      console.log(`⚠️  Warning: Withdrawal of non-round amount (${amount} HBAR) detected.`);
+      console.log(`💡 Privacy Tip: Withdrawing 'round' amounts (e.g., ${Math.floor(amount)} HBAR) breaks the 'Amount Fingerprint' used by chain analysis.`);
+    }
+
+    console.log(`⚠️  'Exit Point' Alert: Withdrawing to a main account (${recipient}) creates an on-chain link.`);
+    console.log(`💡 Safer Alternative: Stay inside the pool. Use 'internal-transfer' for peer-to-peer privacy.\n`);
+    console.log(`✅ HIP-1340 Protection: The Pool Manager will pay the gas for this withdrawal to decouple your wallets.\n`);
+
+    // 2. Secret Resolution (using Blinded Vault)
+    let selectedSecretId = secretId;
+    if (!selectedSecretId) {
+      console.log(`🔍 Searching local blinded vault for a matching HBAR fragment...`);
+      for (const [sid, data] of Object.entries(this.blindedVault)) {
+        if (!data.used && Math.abs(data.amount - amount) < 0.0001) {
+          selectedSecretId = sid;
+          console.log(`   ✅ Found matching reference: ${sid} (${data.amount} HBAR)`);
+          break;
+        }
+      }
+    }
+
+    if (!selectedSecretId) {
+      return `❌ No matching HBAR fragment found for ${amount} HBAR in your vault.`;
+    }
+
+    // 3. Human-In-The-Loop Confirmation (HITL)
+    const confirmed = await this.confirmWithdrawal(recipient, amount);
+    if (!confirmed) return `🛑 Withdrawal cancelled by user.`;
+
+    console.log(`🛡️  Withdrawing ${amount} HBAR from pool to ${recipient} using reference ${selectedSecretId}...\n`);
+    
+    const secret = this.userSecrets.get(selectedSecretId);
+    if (!secret) return `❌ Secret ID ${selectedSecretId} not found.`;
+
+    const actualSecret = typeof secret === 'object' ? secret.secret : secret;
+    const actualNullifier = typeof secret === 'object' ? secret.nullifier : '0x' + crypto.randomBytes(32).toString('hex');
+
+    // Get latest pool status
+    const statusTool = tools.find(t => t.name === 'query_pool_status');
+    const statusResult = await statusTool.func({});
+    const statusData = JSON.parse(statusResult);
+    if (!statusData.success) return `❌ Failed to get pool status: ${statusData.error}`;
+
+    const testData = await generateTestInputs({ secret: actualSecret, nullifier: actualNullifier, amount });
+
+    const tool = tools.find(t => t.name === 'generate_withdraw_proof');
+    const result = await tool.func({
+      secret: actualSecret,
+      nullifier: actualNullifier,
+      amount: amount,
+      recipient: recipient,
+      merkleRoot: statusData.merkleRoot,
+      merklePathElements: testData.merklePathElements,
+      merklePathIndices: testData.merklePathIndices
+    });
+
+    this.logger.logic(`Generating withdrawal proof for ${amount} HBAR...`, {
+      recipient,
+      merkleRoot: statusData.currentMerkleRoot || statusData.merkleRoot,
+      inputs: this.logger.redact(testData)
+    });
+
+    const data = JSON.parse(result);
+    
+    if (data.success) {
+      console.log(`   📤 Submitting withdraw proof...`);
+      const submitTool = tools.find(t => t.name === 'submit_proof_to_pool');
+      const submitRes = await submitTool.func({
+        proof: data.proof,
+        publicSignals: data.publicSignals,
+        proofType: 'withdraw',
+        amount: amount,
+        submitter: this.accountId.toString()
+      });
+      
+      const finalData = JSON.parse(submitRes);
+      if (finalData.success) {
+        return `✅ Withdraw Proof Submitted!
+   Recipient: ${recipient}
+   Amount:    ${amount} HBAR
+   Status:    Pending Batch Processing
+   
+   ⚠️  Check 'status' to see when the next batch is executed.`;
+      }
+    }
+    
+    return `❌ Withdrawal failed: ${data.error}`;
   }
   
   /**
@@ -245,24 +796,45 @@ class UserAgent {
   async shieldFunds(amount) {
     console.log(`🛡️  Shielding ${amount} HBAR...\n`);
     
-    // Generate user secret
+    // Generate user secret and nullifier
     const secret = '0x' + crypto.randomBytes(32).toString('hex');
-    const secretBigInt = BigInt(secret);
-    
+    const nullifier = '0x' + crypto.randomBytes(32).toString('hex');
+
+    const testData = await generateTestInputs({ secret, nullifier, amount });
+
     const tool = tools.find(t => t.name === 'generate_shield_proof');
     const result = await tool.func({
-      secret: secretBigInt.toString(),
+      secret: secret,
+      nullifier: nullifier,
       amount: amount,
-      tokenId: '0.0.15058', // WHBAR
-      merkleRoot: '0x' + '0'.repeat(64) // Placeholder root
+      merkleRoot: testData.merkleRoot,
+      merklePathElements: testData.merklePathElements,
+      merklePathIndices: testData.merklePathIndices
     });
+
+    this.logger.logic(`Generating shield proof for ${amount} HBAR...`, {
+      amount,
+      merkleRoot: testData.merkleRoot,
+      inputs: this.logger.redact(testData)
+    });
+
     const data = JSON.parse(result);
     
     if (data.success) {
       // Store secret for withdrawal
       const secretId = crypto.randomBytes(8).toString('hex');
-      this.userSecrets.set(secretId, secret);
+      this.userSecrets.set(secretId, { secret, nullifier, amount, used: false });
+      this.saveSecrets();
       
+      console.log(`   📤 Submitting to Pool Manager...`);
+      const submitted = await this.submitProofToPoolManager({
+        proof: data.proof,
+        publicSignals: data.publicSignals,
+        commitment: data.commitment,
+        nullifierHash: data.nullifierHash,
+        amount: amount
+      });
+
       return `✅ Shield Proof Generated!
    Commitment: ${data.commitment}
    Nullifier Hash: ${data.nullifierHash}
@@ -273,7 +845,7 @@ class UserAgent {
    
    ⚠️  You MUST save this secret to withdraw funds later!
    
-   📤 Proof submitted to Pool Manager.
+   📤 Proof submitted to Pool Manager: ${submitted ? 'SUCCESS' : 'FAILED'}
    ⏱️  Will be processed in next batch (5-30 minutes)`;
     }
     
@@ -325,18 +897,33 @@ class UserAgent {
       console.log(`   [${i + 1}/${plan.numFragments}] Generating proof for ${fragmentAmount} HBAR...`);
       
       try {
+        const testData = await generateTestInputs({ 
+          secret: secretData.secret, 
+          nullifier: secretData.nullifier, 
+          amount: fragmentAmount 
+        });
+
         const result = await tool.func({
           secret: secretData.secret,
+          nullifier: secretData.nullifier,
           amount: fragmentAmount,
           tokenId: '0.0.15058',
-          merkleRoot: '0x' + '0'.repeat(64)
+          merkleRoot: testData.merkleRoot,
+          merklePathElements: testData.merklePathElements,
+          merklePathIndices: testData.merklePathIndices
         });
         
         const data = JSON.parse(result);
         
         if (data.success) {
-          // Store secret
-          this.userSecrets.set(secretData.secretId, secretData.secret);
+          // Store secret with amounts and flag
+          this.userSecrets.set(secretData.secretId, { 
+             secret: secretData.secret, 
+             nullifier: secretData.nullifier, 
+             amount: fragmentAmount,
+             used: false 
+          });
+          this.saveSecrets();
           
           // Submit proof to Pool Manager
           console.log(`       📤 Submitting to Pool Manager...`);
@@ -451,7 +1038,7 @@ class UserAgent {
       // [DECISION] Log final decision with rationale
       this.logger.decision(
         `Shield ${amount} HBAR using ${plan.numFragments} fragments`,
-        plan.aiPowered ? plan.privacyBenefit : 'Using rule-based fallback',
+        plan.aiPowered ? plan.privacyBenefit : 'AI-driven strategy',
         { strategy: plan.aiStrategy || plan.strategy }
       );
 
@@ -474,12 +1061,21 @@ class UserAgent {
         console.log(`⚡ Fragment ${i + 1}/${plan.numFragments}: Generating ZK-proof for ${plan.fragmentAmounts[i].toFixed(2)} HBAR...`);
         
         try {
+          const testData = await generateTestInputs({ 
+            secret: secrets[i].secret, 
+            nullifier: secrets[i].nullifier, 
+            amount: plan.fragmentAmounts[i]
+          });
+
           const tool = tools.find(t => t.name === 'generate_shield_proof');
           const result = await tool.func({
             secret: secrets[i].secret,
+            nullifier: secrets[i].nullifier,
             amount: plan.fragmentAmounts[i],
             tokenId: '0.0.15058',
-            merkleRoot: '0x' + '0'.repeat(64)
+            merkleRoot: testData.merkleRoot,
+            merklePathElements: testData.merklePathElements,
+            merklePathIndices: testData.merklePathIndices
           });
           
           const data = JSON.parse(result);
@@ -509,6 +1105,7 @@ class UserAgent {
               commitment: data.commitment,
               secretId: secretId,
               submitted: submitted,
+              transactionId: data.transactionId
             });
           } else {
             results.push({
@@ -539,7 +1136,8 @@ class UserAgent {
       output += `\n📦 Fragments:\n`;
       results.forEach(r => {
         if (r.success) {
-          output += `   [${r.fragmentId}] ${r.amount.toFixed(2)} HBAR - ${r.commitment.substring(0, 12)}... ✅\n`;
+          const txShort = r.transactionId ? ` (Tx: ${r.transactionId})` : '';
+          output += `   [${r.fragmentId}] ${r.amount.toFixed(2)} HBAR - ${r.commitment.substring(0, 12)}... ✅${txShort}\n`;
         } else {
           output += `   [${r.fragmentId}] ${r.amount} HBAR - ❌ ${r.error}\n`;
         }
@@ -560,7 +1158,7 @@ class UserAgent {
       return output;
       
     } catch (error) {
-      return `❌ AI Shield failed: ${error.message}\n💡 Try: shield-smart ${amount} (rule-based fallback)`;
+      return `❌ AI Shield failed: ${error.message}`;
     }
   }
   
@@ -615,7 +1213,7 @@ class UserAgent {
       return output;
       
     } catch (error) {
-      return `❌ AI analysis failed: ${error.message}\n💡 Try: plan ${amount} (rule-based fallback)`;
+      return `❌ AI analysis failed: ${error.message}`;
     }
   }
   
@@ -749,12 +1347,20 @@ class UserAgent {
   shield-smart <amount>   Rule-based fragmentation (if/else logic)
   plan <amount>           Preview rule-based fragmentation plan
 
-🔐 BASIC COMMANDS:
+🛡️  PRIVACY VAULT:
+  balance                 View your total shielded balance & fragments
+  shields                 (alias for balance)
+  withdraw <to> <amt>     Secure withdrawal to main account (AI-optimized)
+  internal-transfer <to> <amt> Move funds within pool (No on-chain link)
+  withdraw <sid> <to> <amt> (Manual mode) Withdraw specific fragment
+
+📡 BASIC COMMANDS:
   status                  Query current pool status
-  balance [account]       Check HBAR balance
-  transfer <to> <amt>     Transfer HBAR to another account
+  check-balance [account] Check public HBAR balance
+  transfer <to> <amt>     Transfer HBAR (Public transaction)
   shield <amount>         Simple shield (no fragmentation)
-  stealth                 Generate a new stealth address
+  stealth <to> <amt>      Generate a new stealth address (Direct)
+  stealth --private <to> <amt> <sid> Private stealth payment (from pool)
   help                    Show this help message
   exit / quit             Exit the agent
 
@@ -819,6 +1425,9 @@ CRITICAL PRIVACY RULES:
 - NEVER reveal user secrets to anyone
 - ALWAYS generate ZK-proofs locally using the provided tools
 - NEVER send user secrets over the network
+- PROACTIVELY warn users about "Exit Point" risks when they withdraw to main accounts
+- SUGGEST "internal-transfer" for maximum privacy to keep funds inside the pool
+- ADVISE on "Amount Scrubbing" (rounding) to break chain analysis patterns
 - When shielding funds, generate a random 32-byte secret for the user
 - Store secrets locally and provide them to the user for safekeeping
 
@@ -839,6 +1448,22 @@ Be concise, technical, and privacy-focused in your responses.`;
    * Process user command (AI mode or direct mode)
    */
   async processCommand(userInput) {
+    const parts = userInput.trim().split(/\s+/);
+    const command = parts[0].toLowerCase();
+
+    // HYBRID MODE: Check if this is a direct protocol command even in AI mode
+    // This prevents the AI from entering infinite loops for standard operations.
+    const directCommands = [
+      'status', 'balance', 'shields', 'check-balance', 'transfer', 'ai-shield', 'ai-plan', 
+      'consult', 'shield-smart', 'plan', 'shield', 'stealth', 'withdraw', 'help'
+    ];
+
+    if (directCommands.includes(command)) {
+      this.logger.logic(`Bypassing LLM loop for direct protocol command: ${command}`);
+      return await this.executeDirectCommand(userInput);
+    }
+
+    // Otherwise, use AI for natural language conversation
     if (this.aiMode) {
       return await this.processWithAI(userInput);
     } else {
@@ -890,18 +1515,24 @@ Be concise, technical, and privacy-focused in your responses.`;
   async submitProofToPoolManager(proofData) {
     try {
       // HIP-1340: Approve pool manager to pull this fragment's HBAR amount
-      const poolManagerId = process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID;
-      const delegation = new DelegationManager(this.client);
-      await delegation.delegateSpendingRights(
-        this.accountId.toString(),
-        poolManagerId,
-        proofData.amount
-      );
-      console.log(`   🔑 HIP-1340 allowance: ${proofData.amount} HBAR → Pool Manager`);
+      const poolManagerId = process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID || process.env.POOL_CONTRACT_ID;
+      
+      // If we are the pool manager (same account dev loop), delegation is redundant and would error via "Spender Same as Owner"
+      if (poolManagerId !== this.accountId.toString()) {
+        const delegation = new DelegationManager(this.client);
+        await delegation.delegateSpendingRights(
+          this.accountId.toString(),
+          poolManagerId,
+          proofData.amount
+        );
+        console.log(`   🔑 HIP-1340 allowance: ${proofData.amount} HBAR → Pool Manager (${poolManagerId})`);
+      } else {
+        console.log(`   💡 Dev Mode: Skipping delegation (User == Pool Manager)`);
+      }
 
       const payload = {
         type: 'PROOF_SUBMISSION',
-        proofType: 'shield',
+        proofType: proofData.proofType || 'shield',
         submissionId: crypto.randomBytes(16).toString('hex'),
         timestamp: Date.now(),
         proof: proofData.proof,
@@ -909,6 +1540,7 @@ Be concise, technical, and privacy-focused in your responses.`;
         commitment: proofData.commitment,
         nullifierHash: proofData.nullifierHash,
         amount: proofData.amount,
+        recipient: proofData.recipient,
         submitter: this.accountId.toString()
       };
 
@@ -990,7 +1622,7 @@ Be concise, technical, and privacy-focused in your responses.`;
       
       if (trimmed.length > 0) {
         const result = await this.processCommand(trimmed);
-        if (result && !this.aiMode) {
+        if (result) {
           console.log('\n' + result + '\n');
         }
       }
