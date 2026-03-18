@@ -10,6 +10,30 @@ class AgentLogger {
     this.verbose = options.verbose || process.env.AGENT_VERBOSE === 'true';
     this.enableColors = options.enableColors !== false;
     this.prefix = options.prefix || 'AGENT';
+    
+    // Sensitive keys to redact automatically
+    this.SENSITIVE_KEYS = ['secret', 'nullifier', 'privateKey', 'viewPrivateKey', 'spendPrivateKey', 'proof'];
+  }
+
+  /**
+   * Redact sensitive information from objects before logging
+   */
+  redact(obj) {
+    if (!obj || typeof obj !== 'object') return obj;
+    
+    const redacted = Array.isArray(obj) ? [] : {};
+    
+    for (let [key, value] of Object.entries(obj)) {
+      if (this.SENSITIVE_KEYS.some(k => key.toLowerCase().includes(k.toLowerCase()))) {
+        redacted[key] = '[REDACTED]';
+      } else if (typeof value === 'object' && value !== null) {
+        redacted[key] = this.redact(value);
+      } else {
+        redacted[key] = value;
+      }
+    }
+    
+    return redacted;
   }
 
   /**
