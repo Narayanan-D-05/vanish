@@ -469,15 +469,21 @@ class UserAgent {
     console.log(`━`.repeat(40));
     
     return new Promise((resolve) => {
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-      });
-      
-      rl.question(`⚠️  Type 'confirm' to unlock vault & sign transaction: `, (answer) => {
-        rl.close();
-        resolve(answer.toLowerCase() === 'confirm');
-      });
+      if (this.rl) {
+        this.rl.question(`⚠️  Type 'confirm' to unlock vault & sign transaction: `, (answer) => {
+          resolve(answer.trim().toLowerCase() === 'confirm');
+        });
+      } else {
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout
+        });
+        
+        rl.question(`⚠️  Type 'confirm' to unlock vault & sign transaction: `, (answer) => {
+          rl.close();
+          resolve(answer.trim().toLowerCase() === 'confirm');
+        });
+      }
     });
   }
 
@@ -1637,20 +1643,20 @@ Be concise, technical, and privacy-focused in your responses.`;
    * Start interactive chat interface
    */
   async startChat() {
-    const rl = readline.createInterface({
+    this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
       prompt: this.aiMode ? '💬 You: ' : '⚡ Command: '
     });
     
-    rl.prompt();
+    this.rl.prompt();
     
-    rl.on('line', async (input) => {
+    this.rl.on('line', async (input) => {
       const trimmed = input.trim();
       
       if (trimmed.toLowerCase() === 'exit' || trimmed.toLowerCase() === 'quit') {
         console.log('👋 Goodbye! Stay private.');
-        rl.close();
+        this.rl.close();
         process.exit(0);
       }
       
@@ -1661,10 +1667,10 @@ Be concise, technical, and privacy-focused in your responses.`;
         }
       }
       
-      rl.prompt();
+      this.rl.prompt();
     });
     
-    rl.on('close', () => {
+    this.rl.on('close', () => {
       console.log('\n👋 User Agent session ended.');
       process.exit(0);
     });

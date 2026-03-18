@@ -58,8 +58,8 @@ class PoolManager {
     this.proofQueue = [];
     this.MIN_BATCH_SIZE = Number(this.policy.minBatchSize || 2);
     this.MAX_WAIT_TIME = Number(this.policy.maxWaitMinutes || 2) * 60 * 1000;
-    this.MIN_RANDOM_DELAY = Number(this.policy.minDelaySeconds || 10) * 1000;
-    this.MAX_RANDOM_DELAY = Number(this.policy.maxDelayMinutes || 1) * 60 * 1000;
+    this.MIN_RANDOM_DELAY = Number(this.policy.minDelaySeconds || 1) * 1000; // Demo mode: 1s
+    this.MAX_RANDOM_DELAY = Number(this.policy.maxDelaySeconds || 2) * 1000; // Demo mode: 2s
 
     this.firstProofTimestamp = null;
     this.batchScheduled = false;
