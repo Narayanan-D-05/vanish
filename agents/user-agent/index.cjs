@@ -759,7 +759,7 @@ class UserAgent {
       }
 
       const actualSecret = typeof secret === 'object' ? secret.secret : secret;
-      const actualNullifier = typeof secret === 'object' ? secret.nullifier : '0x' + crypto.randomBytes(32).toString('hex');
+      const actualNullifier = (typeof secret === 'object' && secret.nullifier) ? secret.nullifier : '0x' + crypto.randomBytes(32).toString('hex');
       const fragAmount = typeof secret === 'object' ? secret.amount : fragData.amount;
 
       // Get latest pool status
@@ -779,7 +779,7 @@ class UserAgent {
         nullifier: actualNullifier,
         amount: fragAmount,
         recipient: recipient,
-        merkleRoot: statusData.currentMerkleRoot || statusData.merkleRoot,
+        merkleRoot: testData.merkleRoot, // Must match testData path for demo
         merklePathElements: testData.merklePathElements,
         merklePathIndices: testData.merklePathIndices
       });
