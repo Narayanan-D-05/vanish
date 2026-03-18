@@ -1,8 +1,58 @@
-# Vanish Protocol - Agent Service Walkthrough
+# 🌀 Vanish: The Golden Thread (2026 Architecture)
 
-## Overview
+In 2026, **Vanish** isn't just a privacy dApp; it's a **Decentralized Autonomous Privacy Network**. It solves the hardest problem in crypto—making high-privacy ZK systems easy enough for anyone—by offloading the complexity to a specialized **Tri-Agent Cluster**.
 
-The Vanish Pool Manager is not a singleton—it operates as a **Service Agent** within a competitive marketplace. User Agents discover and select Pool Managers based on published HCS metrics including latency, anonymity set size, and fees.
+By combining the **Hedera Agent Kit** with **ZK-SNARKs** and the latest **HIPs**, Vanish creates a system where the AI does the "thinking," the Hedera network provides the "truth," and ZK-proofs provide the "silence."
+
+---
+
+## 🏗️ The Tri-Agent Workflow
+
+### 1. The User Agent (The Architect)
+*   **Agentic Behavior:** Instead of simple one-off transactions, the agent **plans**. It analyzes your balance and network traffic to decide the optimal fragmentation strategy (e.g., shredding 500 HBAR into 12 distinct fragments).
+*   **ZK-Creation:** Generates **Groth16 proofs** locally using `circuits/shield.circom`. Your private keys never leave your device; privacy is "Local-First."
+*   **Hedera Feature:** Uses **HIP-1334 (Private Message Box)**. It discovers the Pool's inbox via account memos and drops encrypted proofs without any direct p2p connection.
+
+### 2. The Pool Manager (The Governor & Relayer)
+*   **Agentic Behavior:** A **Proposer-Guard** system. An LLM "proposes" execution windows based on global anonymity targets, but a **Deterministic Policy Engine** ensures it follows rigid safety rules (e.g., minimum batch sizes).
+*   **Relayer Role:** Acts as the **Privacy Relayer**. It collects ZK-proofs and submits them to the blockchain. This decouples the user's main account from the withdrawal, ensuring the user doesn't have to pay gas (which would dox them).
+*   **ZK-Usage:** Verified via `snarkjs`. The manager acts as a "blind bouncer"—it knows your proof is mathematically sound but cannot see your identity.
+*   **Hedera Feature:** Uses **HIP-1340 (EOA Delegation)**. Users delegate specific code execution to the Vanish contract, allowing the agent to pull funds and settle batches autonomously while the user is offline.
+
+### 3. The Receiver Agent (The Ghost)
+*   **Agentic Behavior:** A **Passive Ghost Monitor**. It lives in the background, scanning the HCS Audit Topic for stealth handshakes.
+*   **Stealth Detection:** Uses a **View Key** and Diffie-Hellman handshakes to autonomously identify "found money" in the public noise.
+*   **Hedera Feature:** Uses **HCS (Hedera Consensus Service)** as a decentralized bulletin board for anonymized announcements.
+
+---
+
+## 🛠️ The 2026 Hedera Power-Stack
+
+| Feature | Role in Vanish | Why it's "Agentic" |
+| :--- | :--- | :--- |
+| **Hedera Agent Kit** | The "Body" | Gives the LLM "hands" to sign HCS messages and HTS transfers. |
+| **HIP-1334** | The "Whisper" | Standardized encrypted inboxes so agents can talk without dApp-specific APIs. |
+| **HIP-1340** | The "Proxy" | Allows the AI to act as a "Legal Representative" for the user's wallet. |
+| **HCS Audit Trail** | The "Memory" | An immutable log of every AI decision, making the agent **Provably Honest**. |
+
+---
+
+## 🧠 Advanced Agentic Privacy
+Vanish wins because the AI is the protocol:
+1.  **Autonomous Risk Detection:** The Pool Manager monitors **Sybil Attacks** and autonomously pauses batches if the **Chainalysis Oracle** flags a risk.
+2.  **Temporal Obfuscation:** The agent decides to wait a random time (e.g., 7m 12s) to break timing patterns.
+3.  **Self-Healing Sync:** Agents use the **HCS Topic History** to autonomously rebuild their state after downtime.
+
+---
+
+## 🚀 Recent Wins & Protocol Upgrades
+
+- **Just-In-Time (JIT) Merkle Synchronization:** Fixed `validStartTime` limits by applying a 15-second delay to the node's HCS listener. Implemented a production-grade JIT layer in the Pool Manager that automatically anchors valid Merkle roots to the contract if they haven't been batched yet, allowing for instant, mathematically-verifiable private spending.
+- **Internal Shielded Swaps:** Upgraded `VanishGuard.sol` with `internalSwap`. This allows funds to move from Alice to Bob *entirely within the pool*. No HBAR ever leaves the contract; only the ownership of the secret commitment changes, leaving zero trace on the public ledger.
+
+---
+
+**"In Vanish, the AI is the Protocol."** We've made privacy goal-oriented, autonomous, and invisible.
 
 ## Architecture: Competitive Marketplace
 
@@ -94,12 +144,26 @@ Every batch decision is:
    - Validation result
    - Signature
 
-Third-party auditors can verify that the Pool Manager followed its policy by:
 1. Fetching the decision from HCS
 2. Verifying the signature
 3. Validating against the policy rules
 
-## Verification Plan
+---
+
+## 🛡️ Provably Honest AI (HCS Auditing)
+
+Vanish solves the "Black Box" problem of AI agents. You don't have to trust that the Pool Manager is being fair; you can verify it.
+
+*   **Decision Hashing:** Every time the AI proposes a batch, it generates a unique `DecisionId`.
+*   **Cryptographic Rationale:** The agent's thinking process (the `Thought Trace`) is hashed along with the batch data.
+*   **HCS Anchoring:** This hash is signed with the Pool Manager's **Decision Key** and sent to a public HCS Topic.
+*   **Immutability:** Once on HCS, the AI cannot "change its mind" or hide why it prioritized certain fragments.
+
+---
+
+## 🧪 Testing & Verification
+
+For a step-by-step Standard Operating Procedure (SOP) to test the entire Tri-Agent flow, see the [Testing Guide](file:///c:/Users/dnara/.gemini/antigravity/brain/3cf64635-4c95-4993-8069-fdfc55f87733/testing_guide.md).
 
 ### Automated Demo Verification
 
@@ -133,6 +197,73 @@ Third-party auditors can verify that the Pool Manager followed its policy by:
 - **Auditability**: HCS provides immutable audit trail
 - **Policy Enforcement**: Safety Guard blocks policy violations
 - **Transparency**: Users can verify Pool Manager behavior
+
+---
+
+## 🛡️ 'Exit Point' Security (The Safe Exit)
+
+In 2026, the most dangerous moment for privacy is the **"Exit Point"**—withdrawing funds from a stealth address into a main account. A simple HBAR transfer creates an on-chain link that analysts can flag. Vanish handles this with an autonomous **Safe Exit** strategy:
+
+| Feature | Direct Transfer (Unsafe) | Vanish Shielded Exit (Safe) |
+| :--- | :--- | :--- |
+| **On-Chain Trail** | `Stealth -> Main` (Clear Link) | `Pool -> Main` (Broken Link) |
+| **Gas Origin** | Main Account (Doxxed) | **Pool Manager (Anonymous)** |
+| **Timing** | Immediate (Linked) | **Randomized Delay (Unlinked)** |
+| **Amount** | Exact Amount (Fingerprinted) | **Scrubbed/Rounded (Anonymized)** |
+
+4. **Gas-less Move (HIP-1340):** The Pool Manager pays the gas fee for the withdrawal via delegated execution, ensuring your main account never "touches" the stealth address to fund the transaction.
+
+### 🖥️ Safe Exit in Action (Terminal Output)
+
+````carousel
+```text
+💬 You: withdraw 0.0.123456 5.57
+
+🛡️  Vanish Privacy Advisory: 'Exit Point' Security Check
+
+⚠️  Warning: Withdrawal of non-round amount (5.57 HBAR) detected.
+💡 Privacy Tip: Withdrawing 'round' amounts (e.g., 5 HBAR) breaks the 'Amount Fingerprint' used by chain analysis.
+
+⚠️  'Exit Point' Alert: Withdrawing to a main account (0.0.123456) creates an on-chain link.
+💡 Safer Alternative: Stay inside the pool. Use 'internal-transfer' for peer-to-peer privacy.
+
+✅ HIP-1340 Protection: The Pool Manager will pay the gas for this withdrawal to decouple your wallets.
+
+🔍 Searching local vault for a matching HBAR fragment...
+...
+```
+<!-- slide -->
+```text
+💬 You: balance
+
+💰 Vanish Shielded Balance: 4.00 HBAR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📦 Available Fragments:
+   - frag_1773741554887_4: 2 HBAR (3/18/2026, 12:29:14 PM)
+   - frag_1773741563107_5: 2 HBAR (3/18/2026, 12:29:23 PM)
+
+💡 To withdraw securely, use: withdraw <recipientAccountId> <amount>
+💡 AI will automatically resolve the secret ID for you.
+```
+````
+## 🔒 Automation & Local Security
+
+Vanish is designed for a "Hands-Off" privacy experience.
+
+---
+
+## 🔒 2026 "Shadow Security" (Implemented)
+
+Vanish has been hardened against the next generation of AI-driven threats:
+
+1.  **Secretless Agent Architecture:** The AI "Thinks" using blinded reference IDs. It never touches a raw private key.
+2.  **AES-256-GCM Vaulting:** Your ZK-secrets are encrypted at rest with industry-standard AES-GCM, keyed by your master password.
+3.  **Human-In-The-Loop (HITL):** The agent *proposes* a withdrawal, but it cannot sign the transaction until you type `confirm` in the terminal.
+4.  **Log Redaction:** Sensitive ZK-inputs (secrets, nullifiers) are automatically **[REDACTED]** from all agent traces, ensuring no data leaks even in verbose mode.
+
+### 🧪 Ready to verify?
+Follow the **[Official Testing SOP](file:///c:/Users/dnara/.gemini/antigravity/brain/3cf64635-4c95-4993-8069-fdfc55f87733/testing_guide.md)** to run your first 100% private, 100% secure transfer.
 
 ## Integration Points
 

@@ -78,8 +78,8 @@ template Withdraw(levels) {
     component amountCheck = Num2Bits(64);
     amountCheck.in <== amount;
     
-    // Recipient address constraint
-    component recipientCheck = Num2Bits(64);
+    // Recipient address constraint (160-bit EVM address)
+    component recipientCheck = Num2Bits(160);
     recipientCheck.in <== recipient;
 }
 
