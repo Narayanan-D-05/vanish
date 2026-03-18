@@ -438,16 +438,22 @@ class UserAgent {
    * Secure subset sum helper
    */
   findExactSubset(target, available) {
+    console.log(`🔍 [DEBUG] Target: ${target}, Available: ${available.length} fragments`);
     available.sort((a,b) => b.amount - a.amount);
     const result = [];
     let currentSum = 0;
     for (const item of available) {
-      if (currentSum + item.amount <= target) {
+      console.log(`   - checking fragment ${item.id} (${item.amount} HBAR)...`);
+      if (currentSum + item.amount <= target + 0.0001) {
         currentSum += item.amount;
         result.push(item);
+        console.log(`     ✅ added to subset. currentSum: ${currentSum}`);
       }
+      if (Math.abs(currentSum - target) < 0.0001) break;
     }
-    return Math.abs(currentSum - target) < 0.0001 ? result : null;
+    const success = Math.abs(currentSum - target) < 0.0001;
+    console.log(`🔍 [DEBUG] Subset Search ${success ? 'SUCCESS' : 'FAILED'}. Sum: ${currentSum}`);
+    return success ? result : null;
   }
 
   /**
