@@ -241,6 +241,7 @@ class UserAgent {
         
         case 'balance':
         case 'shields':
+          this.loadSecrets(); // Refresh from disk
           return this.showShieldedBalance();
           
         case 'check-balance':
@@ -950,9 +951,10 @@ class UserAgent {
              secret: secretData.secret, 
              nullifier: secretData.nullifier, 
              amount: fragmentAmount,
-             used: false 
+             used: false,
+             timestamp: Date.now()
           });
-          this.saveSecrets();
+          this.saveSecrets(); // This now correctly updates blindedVault
           
           // Submit proof to Pool Manager
           console.log(`       📤 Submitting to Pool Manager...`);
@@ -1112,10 +1114,13 @@ class UserAgent {
             const secretId = `frag_${Date.now()}_${i}`;
             this.userSecrets.set(secretId, {
               secret: secrets[i].secret,
+              nullifier: secrets[i].nullifier,
               amount: plan.fragmentAmounts[i],
               commitment: data.commitment,
-              timestamp: new Date().toISOString(),
+              timestamp: Date.now(),
+              used: false
             });
+            this.saveSecrets(); // SAVE TO ENCRYPTED VAULT
             
             // Submit proof to Pool Manager
             console.log(`       📤 Submitting to Pool Manager...`);
