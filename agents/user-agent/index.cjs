@@ -710,84 +710,107 @@ class UserAgent {
     console.log(`✅ HIP-1340 Protection: The Pool Manager will pay the gas for this withdrawal to decouple your wallets.\n`);
 
     // 2. Secret Resolution (using Blinded Vault)
-    let selectedSecretId = secretId;
-    if (!selectedSecretId) {
-      console.log(`🔍 Searching local blinded vault for a matching HBAR fragment...`);
-      for (const [sid, data] of Object.entries(this.blindedVault)) {
-        if (!data.used && Math.abs(data.amount - amount) < 0.0001) {
-          selectedSecretId = sid;
-          console.log(`   ✅ Found matching reference: ${sid} (${data.amount} HBAR)`);
-          break;
-        }
+    let selectedSecretIds = [];
+    if (secretId) {
+      selectedSecretIds = [secretId];
+    } else {
+      console.log(`🔍 Searching local blinded vault for matching HBAR fragments (Aggregation Mode)...`);
+      const available = Object.entries(this.blindedVault)
+        .filter(([sid, data]) => !data.used)
+        .map(([sid, data]) => ({ id: sid, amount: data.amount }));
+      
+      const subset = this.findExactSubset(amount, available);
+      if (subset) {
+        selectedSecretIds = subset.map(s => s.id);
+        console.log(`   ✅ Found ${selectedSecretIds.length} fragments matching ${amount} HBAR: [${selectedSecretIds.join(', ')}]`);
       }
     }
 
-    if (!selectedSecretId) {
-      return `❌ No matching HBAR fragment found for ${amount} HBAR in your vault.`;
+    if (selectedSecretIds.length === 0) {
+      return `❌ No matching HBAR fragments found to satisfy ${amount} HBAR withdrawal.`;
     }
 
     // 3. Human-In-The-Loop Confirmation (HITL)
     const confirmed = await this.confirmWithdrawal(recipient, amount);
     if (!confirmed) return `🛑 Withdrawal cancelled by user.`;
 
-    console.log(`🛡️  Withdrawing ${amount} HBAR from pool to ${recipient} using reference ${selectedSecretId}...\n`);
-    
-    const secret = this.userSecrets.get(selectedSecretId);
-    if (!secret) return `❌ Secret ID ${selectedSecretId} not found.`;
-
-    const actualSecret = typeof secret === 'object' ? secret.secret : secret;
-    const actualNullifier = typeof secret === 'object' ? secret.nullifier : '0x' + crypto.randomBytes(32).toString('hex');
-
-    // Get latest pool status
-    const statusTool = tools.find(t => t.name === 'query_pool_status');
-    const statusResult = await statusTool.func({});
-    const statusData = JSON.parse(statusResult);
-    if (!statusData.success) return `❌ Failed to get pool status: ${statusData.error}`;
-
-    const testData = await generateTestInputs({ secret: actualSecret, nullifier: actualNullifier, amount });
-
-    const tool = tools.find(t => t.name === 'generate_withdraw_proof');
-    const result = await tool.func({
-      secret: actualSecret,
-      nullifier: actualNullifier,
-      amount: amount,
-      recipient: recipient,
-      merkleRoot: statusData.merkleRoot,
-      merklePathElements: testData.merklePathElements,
-      merklePathIndices: testData.merklePathIndices
-    });
-
-    this.logger.logic(`Generating withdrawal proof for ${amount} HBAR...`, {
-      recipient,
-      merkleRoot: statusData.currentMerkleRoot || statusData.merkleRoot,
-      inputs: this.logger.redact(testData)
-    });
-
-    const data = JSON.parse(result);
-    
-    if (data.success) {
-      console.log(`   📤 Submitting withdraw proof...`);
-      const submitTool = tools.find(t => t.name === 'submit_proof_to_pool');
-      const submitRes = await submitTool.func({
-        proof: data.proof,
-        publicSignals: data.publicSignals,
-        proofType: 'withdraw',
-        amount: amount,
-        submitter: this.accountId.toString()
-      });
+    let totalSuccess = 0;
+    for (const sid of selectedSecretIds) {
+      const fragData = this.blindedVault[sid];
+      console.log(`🛡️  Withdrawing fragment ${sid} (${fragData.amount} HBAR) to ${recipient}...\n`);
       
-      const finalData = JSON.parse(submitRes);
-      if (finalData.success) {
-        return `✅ Withdraw Proof Submitted!
-   Recipient: ${recipient}
-   Amount:    ${amount} HBAR
-   Status:    Pending Batch Processing
-   
-   ⚠️  Check 'status' to see when the next batch is executed.`;
+      const secret = this.userSecrets.get(sid);
+      if (!secret) {
+        console.error(`❌ Secret ${sid} missing from full vault.`);
+        continue;
+      }
+
+      const actualSecret = typeof secret === 'object' ? secret.secret : secret;
+      const actualNullifier = typeof secret === 'object' ? secret.nullifier : '0x' + crypto.randomBytes(32).toString('hex');
+      const fragAmount = typeof secret === 'object' ? secret.amount : fragData.amount;
+
+      // Get latest pool status
+      const statusTool = tools.find(t => t.name === 'query_pool_status');
+      const statusResult = await statusTool.func({});
+      const statusData = JSON.parse(statusResult);
+      if (!statusData.success) {
+        console.error(`❌ Failed to get pool status: ${statusData.error}`);
+        continue;
+      }
+
+      const testData = await generateTestInputs({ secret: actualSecret, nullifier: actualNullifier, amount: fragAmount });
+
+      const tool = tools.find(t => t.name === 'generate_withdraw_proof');
+      const result = await tool.func({
+        secret: actualSecret,
+        nullifier: actualNullifier,
+        amount: fragAmount,
+        recipient: recipient,
+        merkleRoot: statusData.currentMerkleRoot || statusData.merkleRoot,
+        merklePathElements: testData.merklePathElements,
+        merklePathIndices: testData.merklePathIndices
+      });
+
+      this.logger.logic(`Generating withdrawal proof for ${fragAmount} HBAR...`, {
+        recipient,
+        merkleRoot: statusData.currentMerkleRoot || statusData.merkleRoot,
+        inputs: this.logger.redact(testData)
+      });
+
+      const data = JSON.parse(result);
+      
+      if (data.success) {
+        console.log(`   📤 Submitting withdraw proof for ${fragAmount} HBAR...`);
+        const submitTool = tools.find(t => t.name === 'submit_proof_to_pool');
+        const submitRes = await submitTool.func({
+          proof: data.proof,
+          publicSignals: data.publicSignals,
+          proofType: 'withdraw',
+          amount: fragAmount,
+          submitter: this.accountId.toString()
+        });
+        
+        const finalData = JSON.parse(submitRes);
+        if (finalData.success) {
+          totalSuccess++;
+          // Mark as used immediately to avoid double spend
+          const realSec = this.userSecrets.get(sid);
+          if (realSec) realSec.used = true;
+          this.saveSecrets();
+        }
       }
     }
+
+    if (totalSuccess === selectedSecretIds.length && totalSuccess > 0) {
+      return `✅ ALL Withdraw Proofs Submitted (${totalSuccess}/${selectedSecretIds.length})!
+   Recipient: ${recipient}
+   Total:      ${amount} HBAR
+   Status:     Pending Batch Processing
+   
+   ⚠️  Check 'status' to see when the next batch is executed.`;
+    }
     
-    return `❌ Withdrawal failed: ${data.error}`;
+    return `❌ Withdrawal partially successful or failed (${totalSuccess}/${selectedSecretIds.length}). Check logs.`;
   }
   
   /**
