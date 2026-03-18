@@ -17,6 +17,7 @@ circuits/*.zkey
 circuits/*.r1cs
 circuits/*.wasm
 circuits/*.sym
+circuits/*_js/
 circuits/powersOfTau28_hez_final_*.ptau
 
 # Build outputs
@@ -62,3 +63,6 @@ package-lock.json
 # Environment
 .env
 .env.*
+
+# Scratch
+tmp/
