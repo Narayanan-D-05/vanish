@@ -11,7 +11,7 @@ const https = require('https');
  * - Creates Solidity verifier contracts
  */
 
-const CIRCUITS_DIR = path.join(__dirname, 'circuits');
+const CIRCUITS_DIR = path.join(__dirname, '..', 'circuits');
 const PTAU_FILE = 'powersOfTau28_hez_final_21.ptau';
 const PTAU_URL = `https://storage.googleapis.com/zkevm/ptau/${PTAU_FILE}`;
 
@@ -70,9 +70,9 @@ async function downloadPtau() {
 async function compileCircuit(name) {
   console.log(`\n🔧 Compiling ${name}.circom...`);
 
-  const inputFile = path.join('circuits', `${name}.circom`);
-  const outputDir = path.join('circuits', 'build');
-  const includeDir = `node_modules`;
+  const inputFile = path.join(__dirname, '..', 'circuits', `${name}.circom`);
+  const outputDir = path.join(__dirname, '..', 'circuits', 'build');
+  const includeDir = path.join(__dirname, '..', 'node_modules');
 
   if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
@@ -86,8 +86,8 @@ async function compileCircuit(name) {
   // Compile with circom2 (increase memory limit for 1.2M+ constraint circuits)
   // Run from the root directory so node_modules resolves correctly
   await runCommand(
-    `node --max-old-space-size=8192 node_modules/circom2/cli.js "${wasmInput}" --r1cs --wasm --sym -o "${wasmOutput}" -l "${wasmInclude}"`,
-    __dirname
+    `node --max-old-space-size=8192 "${path.join(includeDir, 'circom2', 'cli.js')}" "${wasmInput}" --r1cs --wasm --sym -o "${wasmOutput}" -l "${wasmInclude}"`,
+    path.dirname(includeDir)
   );
 
   console.log(`✅ ${name}.circom compiled`);
@@ -131,7 +131,7 @@ async function generateSolidityVerifier(circuitName) {
 
   await runCommand(
     `npx snarkjs zkey export solidityverifier "${zkeyFile}" "${contractFile}"`,
-    __dirname
+    path.dirname(includeDir)
   );
 
   console.log(`✅ Solidity verifier generated: contracts/${circuitName}Verifier.sol`);
