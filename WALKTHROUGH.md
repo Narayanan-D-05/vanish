@@ -47,8 +47,10 @@ Vanish wins because the AI is the protocol:
 
 ## 🚀 Recent Wins & Protocol Upgrades
 
-- **Just-In-Time (JIT) Merkle Synchronization:** Fixed `validStartTime` limits by applying a 15-second delay to the node's HCS listener. Implemented a production-grade JIT layer in the Pool Manager that automatically anchors valid Merkle roots to the contract if they haven't been batched yet, allowing for instant, mathematically-verifiable private spending.
-- **Internal Shielded Swaps:** Upgraded `VanishGuard.sol` with `internalSwap`. This allows funds to move from Alice to Bob *entirely within the pool*. No HBAR ever leaves the contract; only the ownership of the secret commitment changes, leaving zero trace on the public ledger.
+- **Just-In-Time (JIT) Merkle Synchronization:** Fixed `minBatchSize` policy conflicts in the Pool Manager. Implemented a production-grade JIT layer that autonomously anchors Merkle roots to satisfying the contract's anonymity policy (min size 2).
+- **Autonomous Triple-Verifier Infrastructure:** Migrated to a modular 2026 architecture where `Shield`, `Withdraw`, and `Exclusion` verifiers are independent contracts linked to a central `VanishGuard` gateway. This enables parallel scaling and independent circuit upgrades without redeploying the main pool logic.
+- **Persistent Root Tracking & Verification:** The Pool Manager now features local persistence for anchored roots (`config/anchored_roots.json`) and performs real-time on-chain verification of root existence before every withdrawal, eliminating "Zero-Knowledge Race Conditions."
+- **AI Fragmentation Safety Guard:** Implemented a protocol-level override in the User Agent that enforces a minimum of 4 fragments for "Quiet Pools" (anonymity set < 10). This prevents LLM reasoning/output contradictions from compromising user privacy and ensures high-entropy noise regardless of AI hallucination.
 
 ---
 
