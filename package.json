@@ -15,6 +15,7 @@
     "start:user": "node agents/user-agent/index.cjs",
     "start:user:ai": "node agents/user-agent/ai-mode.cjs",
     "start:receiver": "node agents/receiver-agent/index.cjs",
+    "start:receiver:demo": "node agents/receiver-agent/index.cjs",
     "start:all": "npx concurrently -n \"POOL,RCVR,USER\" -c \"magenta,blue,green\" \"npm run start:pool\" \"npm run start:receiver\" \"npm run start:user\"",
     "demo": "node demo-run.cjs",
     "test:agents": "node test-agents.cjs",
