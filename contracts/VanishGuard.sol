@@ -149,17 +149,17 @@ contract VanishGuard {
     //  Core: Batch Submission
     // ─────────────────────────────────────────────
 
-    function submitBatch(uint32 size, uint256 delay, uint256 age, bytes32 root, bytes32 audit) external {
-        _submitBatchInternal(size, delay, age, root, audit);
+    function submitBatch(uint32 size, uint256 delay, uint256 age, bytes32[] calldata roots, bytes32 audit) external {
+        _submitBatchInternal(size, delay, age, roots, audit);
     }
 
-    function submitBatchWithDecision(uint32 size, uint256 delay, uint256 age, bytes32 root, bytes32 audit, bytes32 envHash, bytes calldata sig) external {
+    function submitBatchWithDecision(uint32 size, uint256 delay, uint256 age, bytes32[] calldata roots, bytes32 audit, bytes32 envHash, bytes calldata sig) external {
         if (envHash == bytes32(0)) revert EmptyDecisionEnvelopeHash();
         if (decisionEnvelopeSeen[envHash]) revert DecisionEnvelopeReplay(envHash);
         address recovered = _recoverDecisionSigner(envHash, sig);
         if (recovered != decisionSigner) revert InvalidDecisionSignature(recovered, decisionSigner);
 
-        _submitBatchInternal(size, delay, age, root, audit);
+        _submitBatchInternal(size, delay, age, roots, audit);
         decisionEnvelopeSeen[envHash] = true;
         emit DecisionEnvelopeAnchored(envHash, recovered, keccak256(sig), block.timestamp);
     }
@@ -309,15 +309,19 @@ contract VanishGuard {
         emit PolicyUpdated(ver, min, max, minD, allowed.length);
     }
 
-    function _submitBatchInternal(uint32 size, uint256 dMs, uint256 aMs, bytes32 root, bytes32 audit) internal {
+    function _submitBatchInternal(uint32 size, uint256 dMs, uint256 aMs, bytes32[] calldata roots, bytes32 audit) internal {
         if (size < policy.minBatchSize) revert BatchSizeTooSmall(size, policy.minBatchSize);
         if (size > policy.maxBatchSize) revert BatchSizeTooLarge(size, policy.maxBatchSize);
-        if (root == bytes32(0)) revert EmptyMerkleRoot();
+        if (roots.length == 0) revert EmptyMerkleRoot();
 
-        if (currentMerkleRoot != bytes32(0)) rootHistory[currentMerkleRoot] = true;
-        currentMerkleRoot = root;
+        for (uint256 i = 0; i < roots.length; i++) {
+            bytes32 root = roots[i];
+            if (root == bytes32(0)) revert EmptyMerkleRoot();
+            rootHistory[root] = true;
+            currentMerkleRoot = root; // Last one becomes current, but all are valid via rootHistory
+            emit BatchApproved(root, audit, size, dMs, block.timestamp);
+        }
         totalBatchesApproved++;
-        emit BatchApproved(root, audit, size, dMs, block.timestamp);
     }
 
     function _requireAllowedDenomination(uint256 amt) internal view {
