@@ -541,14 +541,15 @@ const queryPoolStatusTool = new DynamicStructuredTool({
 
 /**
  * Tool: Generate Stealth Address
+ * Uses secp256k1 homomorphic key derivation for proper stealth addresses
  */
 const generateStealthAddressTool = new DynamicStructuredTool({
   name: 'generate_stealth_address',
-  description: 'Generates a one-time stealth address for a recipient.',
+  description: 'Generates a one-time stealth address for a recipient using secp256k1 homomorphic derivation.',
   schema: z.object({
     recipientAccountId: z.string().describe('Target Hedera account ID'),
     recipientViewKey: z.string().describe('Public view key (X25519)'),
-    recipientSpendKey: z.string().describe('Public spend key (X25519)'),
+    recipientSpendKey: z.string().describe('Public spend key (secp256k1 private key hex)'),
     amount: z.number().describe('Amount in HBAR')
   }),
   func: async ({ recipientAccountId, recipientViewKey, recipientSpendKey, amount }) => {
@@ -556,19 +557,41 @@ const generateStealthAddressTool = new DynamicStructuredTool({
     if (!client) throw new Error('Hedera credentials not configured');
 
     const hip1334 = require('../../lib/hip1334.cjs');
+    const { keccak256 } = require('js-sha3');
+    const { ethers } = require('ethers');
+    
+    // Generate ephemeral X25519 key pair
     const { privateKeyHex: ephPriv, publicKeyHex: ephPub } = hip1334.generateX25519KeyPair();
     
-    // Shared Secret (X25519)
-    const sharedSecret = hip1334.x25519SharedSecret(ephPriv, recipientViewKey.replace('0x', '')).toString('hex');
+    // Compute shared secret via X25519
+    const sharedSecretBuffer = hip1334.x25519SharedSecret(ephPriv, recipientViewKey.replace('0x', ''));
+    const sharedSecretHex = sharedSecretBuffer.toString('hex');
     
-    // Derive Stealth Address (Ethereum-style)
-    const stealthAddress = keccak256(Buffer.concat([
-      Buffer.from(sharedSecret, 'hex'), 
-      Buffer.from(recipientSpendKey.replace('0x', ''), 'hex')
-    ]));
-    const shortAddress = `0x${stealthAddress.slice(2, 42)}`;
+    // Compute offset scalar from shared secret
+    const offsetHex = keccak256(Buffer.from(sharedSecretHex, 'hex'));
+    const offsetBigInt = BigInt('0x' + offsetHex);
+    
+    // secp256k1 curve order
+    const n = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141');
+    
+    // Get spend private key
+    const spendPrivateKeyHex = recipientSpendKey.replace('0x', '');
+    const spendBigInt = BigInt('0x' + spendPrivateKeyHex);
+    
+    // Homomorphic derivation: stealthPrivate = (spendPrivate + offset) mod n
+    const stealthPrivateBigInt = (spendBigInt + offsetBigInt) % n;
+    const stealthPrivateHex = '0x' + stealthPrivateBigInt.toString(16).padStart(64, '0');
+    
+    // Derive stealth public key from stealth private key
+    const stealthSigningKey = new ethers.SigningKey(stealthPrivateHex);
+    const stealthPublicKey = stealthSigningKey.publicKey;
+    
+    // Stealth address: keccak256 of 64-byte uncompressed pubkey (skip '0x04' prefix = 4 chars) → last 20 bytes
+    const stealthAddressFull = keccak256(Buffer.from(stealthPublicKey.slice(4), 'hex'));
+    const shortAddress = '0x' + stealthAddressFull.slice(24, 64);
 
     console.log(`📡 [STEALTH] Sending ${amount} HBAR to derived address: ${shortAddress}`);
+    console.log(`🔑 Stealth PubKey: ${stealthPublicKey.slice(0, 30)}...`);
 
     // 1. Send the actual HBAR on-chain to the stealth address
     const transaction = await new TransferTransaction()

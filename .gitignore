@@ -45,6 +45,8 @@ Thumbs.db
 # Secrets
 secrets.json
 receiver_vault.json
+vault_*.json
+pending_*.json
 pending_withdrawals.json
 agents/**/.hip1334-keys.json
 agents/**/.stealth-keys.json
