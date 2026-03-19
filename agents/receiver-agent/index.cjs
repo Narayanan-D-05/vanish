@@ -24,8 +24,8 @@ const hip1334 = require('../../lib/hip1334.cjs');
 class ReceiverAgent {
   constructor() {
     // Hedera client setup
-    this.accountId = AccountId.fromString(process.env.HEDERA_ACCOUNT_ID);
-    this.privateKey = PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY);
+    this.accountId = AccountId.fromString(process.env.RECEIVER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID);
+    this.privateKey = PrivateKey.fromString(process.env.RECEIVER_PRIVATE_KEY || process.env.HEDERA_PRIVATE_KEY);
     this.client = Client.forTestnet();
     this.client.setOperator(this.accountId, this.privateKey);
 
@@ -40,6 +40,11 @@ class ReceiverAgent {
     // Track detected stealth addresses
     this.detectedAddresses = new Set();
     this.claimedNullifiers = new Set();
+
+    // Vault for received internal swap commitments
+    this.vaultPath = path.join(__dirname, '..', '..', 'receiver_vault.json');
+    this.receivedCommitments = new Map();
+    this.loadVault();
 
     console.log('👀 Receiver Agent initialized');
     console.log(`   Account: ${this.accountId}`);
@@ -100,6 +105,87 @@ class ReceiverAgent {
     }, null, 2));
 
     console.log('   ✅ Stealth keypair saved to .stealth-keys.json');
+  }
+
+  /**
+   * Load received commitments from vault
+   */
+  loadVault() {
+    try {
+      const data = require('fs').readFileSync(this.vaultPath, 'utf8');
+      const parsed = JSON.parse(data);
+      this.receivedCommitments = new Map(Object.entries(parsed.commitments || {}));
+      console.log(`📂 Loaded ${this.receivedCommitments.size} received commitments from vault`);
+    } catch (err) {
+      console.log('📂 No existing vault found, starting fresh');
+      this.receivedCommitments = new Map();
+    }
+  }
+
+  /**
+   * Save received commitments to vault
+   */
+  saveVault() {
+    try {
+      const data = {
+        accountId: this.accountId.toString(),
+        commitments: Object.fromEntries(this.receivedCommitments),
+        updatedAt: new Date().toISOString()
+      };
+      require('fs').writeFileSync(this.vaultPath, JSON.stringify(data, null, 2));
+    } catch (err) {
+      console.warn('⚠️ Failed to save vault:', err.message);
+    }
+  }
+
+  /**
+   * Process internal swap notification - store the new commitment
+   */
+  async processInternalSwap(payload) {
+    const { newCommitment, newSecret, newNullifier, amount, sourceCommitment, senderAccountId, transactionId } = payload;
+
+    // Verify this is for us
+    if (payload.recipientAccountId !== this.accountId.toString()) {
+      console.log(`   ℹ️ Internal swap not for us (recipient: ${payload.recipientAccountId})`);
+      return;
+    }
+
+    console.log('\n✨ INTERNAL SWAP RECEIVED! ✨');
+    console.log(`   Amount: ${amount} HBAR`);
+    console.log(`   From:   ${senderAccountId}`);
+    console.log(`   New Commitment: ${newCommitment?.slice(0, 20)}...`);
+    console.log(`   Tx:     ${transactionId}`);
+
+    // Store the commitment with secrets (NEEDED FOR WITHDRAWAL)
+    const commitmentId = `recv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.receivedCommitments.set(commitmentId, {
+      commitment: newCommitment,
+      secret: newSecret,           // CRITICAL: Needed to generate withdrawal proof
+      nullifier: newNullifier,     // CRITICAL: Needed to generate withdrawal proof
+      sourceCommitment,
+      amount,
+      senderAccountId,
+      transactionId,
+      receivedAt: Date.now(),
+      status: 'PENDING'
+    });
+    this.saveVault();
+
+    console.log(`   💾 Stored in vault as: ${commitmentId}`);
+    console.log(`   🔒 Status: Available for withdrawal (use 'withdraw' command)\n`);
+
+    // Send acknowledgment
+    try {
+      await hip1334.sendEncryptedMessage(this.client, senderAccountId, {
+        type: 'INTERNAL_SWAP_ACK',
+        originalCommitment: newCommitment,
+        receivedAt: Date.now(),
+        status: 'CONFIRMED'
+      });
+      console.log(`   📨 Acknowledgment sent to sender`);
+    } catch (ackErr) {
+      console.warn(`   ⚠️ Failed to send acknowledgment: ${ackErr.message}`);
+    }
   }
 
   /**
@@ -178,8 +264,11 @@ class ReceiverAgent {
 
           const payload = JSON.parse(messageString);
 
-          // Log all received message types for debugging
-          console.log(`📨 Received HCS message: ${payload.type || 'UNKNOWN'}`);
+          // Log only relevant message types (filter out noise in shared topic mode)
+          const relevantTypes = ['STEALTH_ANNOUNCEMENT', 'PRIVACY_BATCH', 'INTERNAL_SWAP', 'STEALTH_TRANSFER', 'WITHDRAWAL_COMPLETE'];
+          if (relevantTypes.includes(payload.type)) {
+            console.log(`📨 Received HCS message: ${payload.type}`);
+          }
 
           // Check for stealth address announcements
           if (payload.type === 'STEALTH_ANNOUNCEMENT') {
@@ -191,8 +280,19 @@ class ReceiverAgent {
             await this.checkBatchForFunds(payload);
           }
 
-          else {
-            console.log(`   ⚠️  Unhandled message type: ${payload.type}\n`);
+          // Check for internal swap notifications (direct encrypted message)
+          else if (payload.type === 'INTERNAL_SWAP') {
+            // Only process if meant for this receiver
+            if (payload.recipientAccountId === this.accountId.toString()) {
+              await this.processInternalSwap(payload);
+            } else {
+              // Message is for someone else, ignore silently
+            }
+          }
+
+          else if (payload.type && !['AI_DECISION_AUDIT', 'PRIVACY_BATCH', 'STEALTH_ANNOUNCEMENT'].includes(payload.type)) {
+            // Only log unhandled for message types we might care about
+            // Silently ignore system messages like AI_DECISION_AUDIT
           }
 
         } catch (error) {
@@ -459,11 +559,53 @@ async function main() {
     const { Client, PrivateKey, AccountId } = require('@hashgraph/sdk');
     const client = Client.forTestnet();
     client.setOperator(
-      AccountId.fromString(process.env.HEDERA_ACCOUNT_ID),
-      PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY)
+      AccountId.fromString(process.env.RECEIVER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID),
+      PrivateKey.fromString(process.env.RECEIVER_PRIVATE_KEY || process.env.HEDERA_PRIVATE_KEY)
     );
 
     hip1334.listenToInbox(client, inboxTopicId, inboxPrivKey, async (payload) => {
+      // FILTER: Only process messages meant for this receiver
+      // In shared topic mode, we get everyone's messages - ignore ones not for us
+      if (payload.recipientAccountId && payload.recipientAccountId !== agent.accountId.toString()) {
+        // Silently ignore - this message is for someone else
+        return;
+      }
+
+      if (payload.type === 'INTERNAL_SWAP') {
+        console.log('\n🔄 [Receiver] Received INTERNAL SWAP notification!');
+        console.log(`   Amount: ${payload.amount} HBAR`);
+        console.log(`   From: ${payload.senderAccountId}`);
+        console.log(`   New Commitment: ${payload.newCommitment?.slice(0, 20)}...`);
+
+        // Store in receiver's vault
+        const commitmentId = `recv_${Date.now()}`;
+        const fs = require('fs');
+        const path = require('path');
+        const vaultPath = path.join(__dirname, '../../receiver_vault.json');
+
+        let vault = { commitments: {} };
+        if (fs.existsSync(vaultPath)) {
+          vault = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
+        }
+
+        vault.commitments[commitmentId] = {
+          commitment: payload.newCommitment,
+          secret: payload.newSecret,              // CRITICAL: Needed to generate withdrawal proof
+          nullifier: payload.newNullifier,        // CRITICAL: Needed to generate withdrawal proof
+          sourceCommitment: payload.sourceCommitment,
+          amount: payload.amount,
+          sender: payload.senderAccountId,
+          transactionId: payload.transactionId,
+          receivedAt: Date.now(),
+          status: 'AVAILABLE'
+        };
+
+        fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
+        console.log(`   💾 Stored in vault as: ${commitmentId}`);
+        console.log(`   ✅ Use 'withdraw ${commitmentId} <recipient> <amount>' to spend\n`);
+        return;
+      }
+
       if (payload.type === 'STEALTH_TRANSFER') {
         if (payload.internalSwap) {
           console.log('\n🔄 [Receiver] Detected INTERNAL SHIELDED SWAP notification!');

@@ -449,9 +449,10 @@ const submitProofToPoolTool = new DynamicStructuredTool({
       if (!poolManagerId) throw new Error('POOL_MANAGER_ACCOUNT_ID not set');
 
       const crypto = require('crypto');
+      const submissionId = crypto.randomBytes(16).toString('hex');
       const message = {
         type: 'PROOF_SUBMISSION',
-        submissionId: crypto.randomBytes(16).toString('hex'),
+        submissionId,
         proofType,
         proof,
         publicSignals,
@@ -469,7 +470,8 @@ const submitProofToPoolTool = new DynamicStructuredTool({
       return JSON.stringify({
         success: true,
         message: `${proofType} proof submitted successfully via HIP-1334.`,
-        transactionId: res.transactionId
+        transactionId: res.transactionId,
+        submissionId
       });
     } catch (error) {
       return JSON.stringify({ success: false, error: error.message });

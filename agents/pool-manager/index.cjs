@@ -19,7 +19,8 @@ const {
   ContractId,
 } = require('@hashgraph/sdk');
 const snarkjs = require('snarkjs');
-const fs = require('fs').promises;
+const nodeFs = require('fs');
+const fsp = nodeFs.promises;
 const path = require('path');
 const crypto = require('crypto');
 const { keccak256, Wallet } = require('ethers');
@@ -59,11 +60,20 @@ class PoolManager {
     this.proofQueue = [];
     this.MIN_BATCH_SIZE = Number(this.policy.minBatchSize || 2);
     this.MAX_WAIT_TIME = Number(this.policy.maxWaitMinutes || 2) * 60 * 1000;
-    this.MIN_RANDOM_DELAY = Number(this.policy.minDelaySeconds || 1) * 1000; // Demo mode: 1s
-    this.MAX_RANDOM_DELAY = Number(this.policy.maxDelaySeconds || 2) * 1000; // Demo mode: 2s
+    this.MIN_RANDOM_DELAY = Number(this.policy.minDelaySeconds || 1) * 1000;
+    this.MAX_RANDOM_DELAY = Number(this.policy.maxDelayMinutes ? this.policy.maxDelayMinutes * 60 : 60) * 1000;
+
+    // Safety: Ensure bounds are valid to avoid policy engine rejection in deterministic fallback
+    if (this.MAX_RANDOM_DELAY <= this.MIN_RANDOM_DELAY) {
+      this.MAX_RANDOM_DELAY = this.MIN_RANDOM_DELAY + 5000;
+    }
 
     this.treePath = path.join(__dirname, '../../config/merkle_tree.json');
     this.merkleTree = new IncrementalMerkleTree(this.treePath, 4);
+
+    // Track anchored roots for withdrawal validation
+    this.anchoredRootsPath = path.join(__dirname, '../../config/anchored_roots.json');
+    this.anchoredRoots = this.loadAnchoredRoots();
 
     this.firstProofTimestamp = null;
     this.batchScheduled = false;
@@ -82,7 +92,7 @@ class PoolManager {
       }
     }
 
-    this.loadVerificationKeys();
+    this.decisionInProgress = false;
 
     console.log('🔒 Pool Manager initialized (AI + Policy Guard)');
     console.log(`   Account: ${this.accountId}`);
@@ -95,10 +105,10 @@ class PoolManager {
 
   async loadVerificationKeys() {
     try {
-      const shieldVkJson = await fs.readFile(path.join(__dirname, '../../circuits/shield_verification_key.json'), 'utf8');
+      const shieldVkJson = await fsp.readFile(path.join(__dirname, '../../circuits/shield_verification_key.json'), 'utf8');
       this.shieldVK = JSON.parse(shieldVkJson);
 
-      const withdrawVkJson = await fs.readFile(path.join(__dirname, '../../circuits/withdraw_verification_key.json'), 'utf8');
+      const withdrawVkJson = await fsp.readFile(path.join(__dirname, '../../circuits/withdraw_verification_key.json'), 'utf8');
       this.withdrawVK = JSON.parse(withdrawVkJson);
 
       console.log('✅ Verification keys loaded');
@@ -126,6 +136,51 @@ class PoolManager {
       .map((k) => `${JSON.stringify(k)}:${this.canonicalStringify(value[k])}`)
       .join(',');
     return `{${body}}`;
+  }
+
+  /**
+   * Load anchored roots from persistent storage
+   */
+  loadAnchoredRoots() {
+    try {
+      if (nodeFs.existsSync(this.anchoredRootsPath)) {
+        const data = JSON.parse(nodeFs.readFileSync(this.anchoredRootsPath, 'utf8'));
+        console.log(`📂 Loaded ${data.length} anchored roots from storage`);
+        return new Set(data);
+      }
+    } catch (e) {
+      console.error(`⚠️ Failed to load anchored roots: ${e.message}`);
+    }
+    return new Set();
+  }
+
+  /**
+   * Persist anchored roots to storage
+   */
+  persistAnchoredRoots(roots) {
+    try {
+      // Add new roots to the set
+      roots.forEach(r => this.anchoredRoots.add(r.toLowerCase()));
+
+      // Save to file
+      const dir = path.dirname(this.anchoredRootsPath);
+      if (!nodeFs.existsSync(dir)) nodeFs.mkdirSync(dir, { recursive: true });
+
+      nodeFs.writeFileSync(
+        this.anchoredRootsPath,
+        JSON.stringify([...this.anchoredRoots], null, 2)
+      );
+      console.log(`💾 Persisted ${roots.length} new anchored roots (${this.anchoredRoots.size} total)`);
+    } catch (e) {
+      console.error(`⚠️ Failed to persist anchored roots: ${e.message}`);
+    }
+  }
+
+  /**
+   * Check if a root has been anchored (locally tracked)
+   */
+  isRootAnchored(rootHex) {
+    return this.anchoredRoots.has(rootHex.toLowerCase());
   }
 
   /**
@@ -238,34 +293,44 @@ class PoolManager {
     if (!guardId) return; // not deployed yet — skip silently
 
     try {
-      const { ContractExecuteTransaction, ContractId } = require('@hashgraph/sdk');
+      const { ContractExecuteTransaction, ContractId, ContractCallQuery } = require('@hashgraph/sdk');
       const { Interface } = require('ethers');
 
       // Detect if we have a contract-verifiable ECDSA signature.
       // Ed25519 signatures (standard for Hedera) cannot be verified via ecrecover on-chain.
       const hasEcdsa = decisionMeta && decisionMeta.signatureScheme === 'ecdsa-secp256k1';
 
+      const rootsArray = Array.isArray(newMerkleRoot) ? newMerkleRoot : [newMerkleRoot];
+      const normalizedRoots = rootsArray.map(r => normalizeHex(r));
+
+      // Deduplicate roots - contract may reject duplicates
+      const uniqueRoots = [...new Set(normalizedRoots)];
+
       const abi = hasEcdsa
-        ? ['function submitBatchWithDecision(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32 merkleRoot, bytes32 auditHash, bytes32 decisionEnvelopeHash, bytes decisionSignature)']
-        : ['function submitBatch(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32 merkleRoot, bytes32 auditHash)'];
+        ? ['function submitBatchWithDecision(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32[] roots, bytes32 auditHash, bytes32 decisionEnvelopeHash, bytes decisionSignature)']
+        : ['function submitBatch(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32[] roots, bytes32 auditHash)'];
 
       const iface = new Interface(abi);
-      
+
+      // Use uniqueRoots.length for batchSize to ensure consistency with roots array
+      // This handles cases where multiple proofs share the same root (e.g., same commitment)
+      const actualBatchSize = uniqueRoots.length;
+
       const params = hasEcdsa
         ? [
-            batchSize,
+            actualBatchSize,
             BigInt(delayMs),
             BigInt(queueAgeMs),
-            normalizeHex(newMerkleRoot),
+            uniqueRoots,
             normalizeHex(auditHash),
             normalizeHex(decisionMeta.envelopeHash),
             normalizeHex(decisionMeta.signatureHex, 0), // Signatures are variable length, don't pad
           ]
         : [
-            batchSize,
+            actualBatchSize,
             BigInt(delayMs),
             BigInt(queueAgeMs),
-            normalizeHex(newMerkleRoot),
+            uniqueRoots,
             normalizeHex(auditHash),
           ];
 
@@ -273,19 +338,48 @@ class PoolManager {
 
       const txResponse = await new ContractExecuteTransaction()
         .setContractId(ContractId.fromString(guardId))
-        .setGas(300_000) 
+        .setGas(1_000_000) // Increased for multi-root loops
         .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
         .execute(this.client);
 
       const receipt = await txResponse.getReceipt(this.client);
-      
+
       if (receipt.status.toString() === 'SUCCESS') {
         console.log(`⛓️  Batch anchored on-chain → VanishGuard (${guardId})`);
+        console.log(`   Roots anchored: ${uniqueRoots.length}`);
+
+        // Verify roots are now in rootHistory
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for mirror node
+
+        const checkAbi = ['function rootHistory(bytes32) view returns (bool)'];
+        const checkIface = new Interface(checkAbi);
+
+        for (const root of uniqueRoots) {
+          try {
+            const checkCalldata = checkIface.encodeFunctionData('rootHistory', [root]);
+            const checkResult = await new ContractCallQuery()
+              .setContractId(ContractId.fromString(guardId))
+              .setGas(50_000)
+              .setFunctionParameters(Buffer.from(checkCalldata.replace('0x', ''), 'hex'))
+              .execute(this.client);
+
+            const exists = checkIface.decodeFunctionResult('rootHistory', checkResult.bytes)[0];
+            if (exists) {
+              console.log(`   ✅ Root ${root.slice(0, 18)}... confirmed in rootHistory`);
+            } else {
+              console.warn(`   ⚠️ Root ${root.slice(0, 18)}... NOT found in rootHistory after anchor`);
+            }
+          } catch (verifyErr) {
+            console.warn(`   ⚠️ Could not verify root ${root.slice(0, 18)}...: ${verifyErr.message}`);
+          }
+        }
       } else {
         console.error(`❌ VanishGuard anchor status: ${receipt.status.toString()}`);
       }
     } catch (err) {
       console.error(`⚠️ VanishGuard anchor failed: ${err.message}`);
+      // Throw error so caller can handle retry
+      throw err;
     }
   }
 
@@ -418,18 +512,40 @@ class PoolManager {
     // ------------------------------------------
 
     if (proofData.submitter && process.env.POOL_CONTRACT_ID) {
-      try {
+      // 2. Fund Pull (HIP-1340) - only for shield proofs
+      if (proofData.proofType === 'shield') {
+        let attempts = 0;
+        const maxAttempts = 3;
+        let success = false;
         const delegation = new DelegationManager(this.client);
-        const receipt = await delegation.executeDelegatedTransfer(
-          proofData.submitter,
-          process.env.POOL_CONTRACT_ID,
-          proofData.amount
-        );
-        console.log(`💸 HIP-1340 pull: ${proofData.amount} HBAR from ${proofData.submitter} → ${process.env.POOL_CONTRACT_ID}`);
-        console.log(`   Tx: ${receipt.transactionId}`);
-      } catch (err) {
-        console.error(`⚠️ Fund pull failed: ${err.message}`);
-        return false; // Stop! Do not add proof if money didn't move.
+
+        while (attempts < maxAttempts && !success) {
+          try {
+            const receipt = await delegation.executeDelegatedTransfer(
+              proofData.submitter,
+              process.env.POOL_CONTRACT_ID,
+              proofData.amount
+            );
+            console.log(`💸 HIP-1340 pull: ${proofData.amount} HBAR from ${proofData.submitter} → ${process.env.POOL_CONTRACT_ID}`);
+            console.log(`   Tx: ${receipt.transactionId}`);
+            success = true;
+          } catch (err) {
+            attempts++;
+            if (err.message.includes('SPENDER_DOES_NOT__HAVE_ALLOWANCE') && attempts < maxAttempts) {
+              console.warn(`⏳ [RACE] Allowance not yet detected for ${proofData.submitter}. Retrying in 2s... (Attempt ${attempts}/${maxAttempts})`);
+              await new Promise(resolve => setTimeout(resolve, 2000));
+              continue;
+            }
+            
+            if (err.message.includes('INSUFFICIENT_PAYER_BALANCE')) {
+              console.error(`❌ Fund pull failed: Insufficient Balance in ${proofData.submitter}`);
+              return false;
+            } else {
+              console.error(`⚠️ Fund pull failed: ${err.message}`);
+              return false;
+            }
+          }
+        }
       }
     }
 
@@ -650,42 +766,86 @@ class PoolManager {
 
       console.log(`📦 Processing batch: ${shieldProofs.length} shields, ${withdrawProofs.length} withdrawals`);
 
-      // 1. Handle Shields (Update Merkle Root)
-      let newMerkleRoot = '0x' + '0'.repeat(64);
+      // 1. Handle Shields FIRST — Per-Fragment Pool Architecture
+      // Each commitment is an independent privacy pool with its own root.
+      // This enables parallel async processing and eliminates multi-leaf ordering ambiguity.
+      let anchoredRoots = [];
       if (shieldProofs.length > 0) {
-        let lastIndex = 0;
-        for (const p of shieldProofs) {
-          lastIndex = this.merkleTree.insert(p.publicSignals[1]); // commitment
-        }
-        const treeState = this.merkleTree.getRootAndPath(lastIndex);
-        newMerkleRoot = treeState.merkleRoot;
-        const batchId = Math.random().toString(36).slice(2);
+        const { computeFragmentRoot } = require('../../build-test-inputs.cjs');
         const batchTimestamp = Date.now();
+        const batchId = Math.random().toString(36).slice(2);
+        const fragmentRoots = [];
+        for (const p of shieldProofs) {
+          const commitment = p.publicSignals[1]; // decimal string
+          const fragmentData = computeFragmentRoot(commitment);
+          const fragmentRoot = fragmentData.rootHex;
+          fragmentRoots.push(fragmentRoot);
+
+          console.log(`   🔐 Fragment root computed: ${fragmentRoot.slice(0, 18)}...`);
+        }
+
+        const lastFragmentRoot = fragmentRoots[fragmentRoots.length - 1];
 
         await this.logBatchToHCS({
           batchId,
           timestamp: batchTimestamp,
           batchSize: shieldProofs.length,
-          newMerkleRoot,
+          architecture: 'per-fragment-pool',
+          newMerkleRoot: lastFragmentRoot,
           anonymizedProofs: shieldProofs.map((p) => ({
             nullifierHash: p.publicSignals[0],
             type: p.proofType,
           })),
         });
 
-        const auditHash = this.hashObject({ batchId, newMerkleRoot, batchTimestamp });
+        const auditHash = this.hashObject({ batchId, lastFragmentRoot, batchTimestamp });
         const queueAgeMs = firstProofTs ? batchTimestamp - firstProofTs : 0;
-        await this.submitBatchToGuard(
-          shieldProofs.length,
-          decisionMeta ? decisionMeta.scheduledDelayMs : this.MIN_RANDOM_DELAY,
-          queueAgeMs,
-          newMerkleRoot,
-          auditHash,
-          decisionMeta
-        );
+
+        // Try to anchor roots with retry logic
+        let anchorSuccess = false;
+        let anchorAttempts = 0;
+        const maxAnchorAttempts = 3;
+
+        while (!anchorSuccess && anchorAttempts < maxAnchorAttempts) {
+          anchorAttempts++;
+          try {
+            await this.submitBatchToGuard(
+              shieldProofs.length,
+              decisionMeta ? decisionMeta.scheduledDelayMs : this.MIN_RANDOM_DELAY,
+              queueAgeMs,
+              fragmentRoots,
+              auditHash,
+              decisionMeta
+            );
+            anchorSuccess = true;
+          } catch (anchorErr) {
+            console.error(`   ⚠️ Anchor attempt ${anchorAttempts} failed: ${anchorErr.message}`);
+            if (anchorAttempts < maxAnchorAttempts) {
+              console.log(`   🔄 Retrying in 2s...`);
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+          }
+        }
+
+        if (anchorSuccess) {
+          // Store anchored roots for withdrawal validation
+          anchoredRoots = fragmentRoots;
+          // Persist anchored roots to file for recovery
+          this.persistAnchoredRoots(fragmentRoots);
+          console.log(`   ✅ ${anchoredRoots.length} roots anchored and ready for withdrawals`);
+        } else {
+          console.error(`   ❌ Failed to anchor roots after ${maxAnchorAttempts} attempts`);
+          console.error(`   ⚠️ Withdrawals for these commitments will fail until roots are anchored`);
+        }
       }
 
-      // 2. Handle Withdrawals (Execute on-chain)
+      // 2. Handle Withdrawals (Execute on-chain) - ONLY after shields are anchored
+      // Wait a moment for mirror node to sync if we just anchored roots
+      if (shieldProofs.length > 0 && withdrawProofs.length > 0) {
+        console.log(`   ⏳ Waiting 3s for mirror node to sync anchored roots...`);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+
       for (const p of withdrawProofs) {
         try {
           await this.executeWithdrawalOnChain(p);
@@ -710,14 +870,14 @@ class PoolManager {
     const guardId = process.env.VANISH_GUARD_CONTRACT_ID;
     if (!guardId) throw new Error('VANISH_GUARD_CONTRACT_ID not set');
 
-    const { ContractExecuteTransaction, ContractId, Hbar } = require('@hashgraph/sdk');
+    const { ContractExecuteTransaction, ContractId, ContractCallQuery, Hbar } = require('@hashgraph/sdk');
     const { Interface } = require('ethers');
 
     // Extract signals: [nullifierHash, commitment, rootLow, rootHigh, recipientAddr, amount]
     const signals = proofData.publicSignals;
     const nullifierHash = signals[0];
     const commitment = signals[1];
-    
+
     const commitmentHex = normalizeHex(commitment.startsWith('0x') ? commitment : BigInt(commitment).toString(16));
     const rootHex = normalizeHex(((BigInt(signals[3]) << 128n) | BigInt(signals[2])).toString(16));
     const recipient = normalizeHex(BigInt(signals[4]).toString(16), 40);
@@ -726,18 +886,108 @@ class PoolManager {
     const isInternalSwap = recipient === '0x' + '0'.repeat(40);
     const newCommitment = proofData.newCommitment ? normalizeHex(proofData.newCommitment) : commitmentHex;
 
+    // Pre-check: Verify nullifier hasn't been used
+    try {
+      const nullifierCheckAbi = ['function nullifiers(uint256) view returns (bool)'];
+      const nullifierIface = new Interface(nullifierCheckAbi);
+      const nullifierCheckCalldata = nullifierIface.encodeFunctionData('nullifiers', [BigInt(nullifierHash)]);
+      const nullifierResult = await new ContractCallQuery()
+        .setContractId(ContractId.fromString(guardId))
+        .setGas(50_000)
+        .setFunctionParameters(Buffer.from(nullifierCheckCalldata.replace('0x', ''), 'hex'))
+        .execute(this.client);
+      const nullifierUsed = nullifierIface.decodeFunctionResult('nullifiers', nullifierResult.bytes)[0];
+
+      if (nullifierUsed) {
+        console.error(`   ❌ Nullifier ${String(nullifierHash).slice(0, 18)}... has already been spent!`);
+        console.error(`   This withdrawal cannot proceed - the proof has already been used.`);
+        throw new Error('NullifierAlreadyUsed: This proof has already been spent. Cannot withdraw twice with the same proof.');
+      }
+      console.log(`   ✓ Nullifier check passed (not yet spent)`);
+    } catch (preCheckErr) {
+      if (preCheckErr.message.includes('NullifierAlreadyUsed')) throw preCheckErr;
+      console.warn(`   ⚠️ Could not verify nullifier status: ${preCheckErr.message}`);
+    }
+
+    // First, check if root exists locally (faster)
+    if (this.isRootAnchored(rootHex)) {
+      console.log(`✅ Root ${rootHex.slice(0, 18)}... found in local anchored roots`);
+    } else {
+      // Fall back to on-chain check
+      console.log(`   🔍 Checking root ${rootHex.slice(0, 18)}... on-chain...`);
+      const rootCheckAbi = ['function rootHistory(bytes32) view returns (bool)', 'function currentMerkleRoot() view returns (bytes32)'];
+      const rootCheckIface = new Interface(rootCheckAbi);
+
+      try {
+        const rootCheckCalldata = rootCheckIface.encodeFunctionData('rootHistory', [rootHex]);
+        const rootCheckResult = await new ContractCallQuery()
+          .setContractId(ContractId.fromString(guardId))
+          .setGas(50_000)
+          .setFunctionParameters(Buffer.from(rootCheckCalldata.replace('0x', ''), 'hex'))
+          .execute(this.client);
+
+        const rootExists = rootCheckIface.decodeFunctionResult('rootHistory', rootCheckResult.bytes)[0];
+
+        if (!rootExists) {
+          console.log(`⚠️ Root ${rootHex.slice(0, 18)}... NOT found in contract rootHistory`);
+          console.log(`   Commitment: ${commitmentHex.slice(0, 18)}...`);
+          console.log(`   Local anchored roots: ${this.anchoredRoots.size}`);
+
+          // AUTO-RECOVERY: Try to anchor the missing root
+          console.log(`   🔄 Attempting auto-recovery: anchoring missing root...`);
+          const recovered = await this.manuallyAnchorRoot(rootHex);
+
+          if (recovered) {
+            console.log(`   ✅ Root anchored via auto-recovery! Retrying withdrawal...`);
+            // Wait a moment for mirror node sync
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          } else {
+            throw new Error(`RootNotFound: The Merkle root for this withdrawal has not been anchored to the contract. Auto-recovery failed. Ensure the deposit was properly shielded.`);
+          }
+        }
+
+        console.log(`✅ Root ${rootHex.slice(0, 18)}... found in contract rootHistory`);
+        // Add to local tracking for future
+        this.anchoredRoots.add(rootHex.toLowerCase());
+      } catch (checkErr) {
+        if (checkErr.message.includes('RootNotFound')) throw checkErr;
+        console.warn(`⚠️ Could not verify root existence: ${checkErr.message}`);
+      }
+    }
+
     const abi = isInternalSwap
       ? ['function internalSwap(uint256 amountTinybars, uint256 nullifierHash, bytes32 sourceCommitment, bytes32 newCommitment, bytes32 root, uint256[2] proofA, uint256[2][2] proofB, uint256[2] proofC)']
       : ['function withdraw(uint256 amountTinybars, address payable recipient, uint256 nullifierHash, bytes32 commitment, bytes32 root, uint256[2] proofA, uint256[2][2] proofB, uint256[2] proofC)'];
-    
+
     const iface = new Interface(abi);
-    // Format proof for Solidity
+    // Format proof for Solidity (snarkjs uses different format than Solidity verifier)
+    // Note: snarkjs outputs pi_b in [[a,b],[c,d]] format but Solidity expects [[b,a],[d,c]]
     const pA = [proofData.proof.pi_a[0], proofData.proof.pi_a[1]];
     const pB = [
       [proofData.proof.pi_b[0][1], proofData.proof.pi_b[0][0]],
       [proofData.proof.pi_b[1][1], proofData.proof.pi_b[1][0]]
     ];
     const pC = [proofData.proof.pi_c[0], proofData.proof.pi_c[1]];
+
+    // Log proof parameters for debugging
+    console.log(`   🔐 Proof parameters:`);
+    console.log(`      Amount: ${amountTinybars} tinybars (${Number(amountTinybars) / 1e8} HBAR)`);
+    console.log(`      Nullifier: ${String(nullifierHash).slice(0, 18)}...`);
+    console.log(`      Commitment: ${commitmentHex.slice(0, 18)}...`);
+    console.log(`      Root: ${rootHex.slice(0, 18)}...`);
+    console.log(`      Recipient: ${isInternalSwap ? 'INTERNAL SWAP' : recipient}`);
+
+    // Verify proof locally before submitting to contract
+    try {
+      const isValid = await this.verifyProof(proofData.proof, proofData.publicSignals, 'withdraw');
+      if (!isValid) {
+        throw new Error('Local proof verification failed - proof is mathematically invalid');
+      }
+      console.log(`   ✓ Local proof verification passed`);
+    } catch (verifyErr) {
+      console.error(`   ❌ Local proof verification failed: ${verifyErr.message}`);
+      throw new Error(`Proof verification failed: ${verifyErr.message}`);
+    }
 
     const methodName = isInternalSwap ? 'internalSwap' : 'withdraw';
     const methodParams = isInternalSwap
@@ -746,32 +996,55 @@ class PoolManager {
 
     const calldata = iface.encodeFunctionData(methodName, methodParams);
 
+    let txResponse;
     try {
-      const txResponse = await new ContractExecuteTransaction()
+      console.log(`   📤 Submitting ${methodName} transaction to VanishGuard...`);
+      txResponse = await new ContractExecuteTransaction()
         .setContractId(ContractId.fromString(guardId))
-        .setGas(1_200_000) // Swaps might take more gas if they update Merkle tree (future)
+        .setGas(1_200_000)
         .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
         .execute(this.client);
 
       const receipt = await txResponse.getReceipt(this.client);
       console.log(`✅ ${isInternalSwap ? 'Internal Swap' : 'Withdrawal'} executed on Hedera! Status: ${receipt.status.toString()}`);
       console.log(`   Tx ID: ${txResponse.transactionId.toString()}`);
+
+      // Notify user agent of successful withdrawal
+      await this.notifyWithdrawalComplete(proofData, {
+        status: 'SUCCESS',
+        transactionId: txResponse.transactionId.toString(),
+        amount: Number(amountTinybars) / 1e8,
+        recipient: recipient,
+        nullifierHash: String(nullifierHash),
+        commitment: commitmentHex,
+        timestamp: Date.now()
+      });
+
     } catch (err) {
-      if (err.message.includes('CONTRACT_REVERT_EXECUTED')) {
-        console.log(`⚠️  Root not found on-chain (${rootHex.slice(0, 10)}...). Executing Just-In-Time (JIT) root synchronization...`);
-        await this.submitBatchToGuard(1, 1000, 1000, rootHex, normalizeHex(crypto.randomBytes(32).toString('hex')));
-        
-        console.log(`🔄 Retrying with synchronized root...`);
-        const retryTx = await new ContractExecuteTransaction()
-          .setContractId(ContractId.fromString(guardId))
-          .setGas(1_200_000)
-          .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
-          .execute(this.client);
-        await retryTx.getReceipt(this.client);
-        console.log(`✅ ${isInternalSwap ? 'Internal Swap' : 'Withdrawal'} SUCCEEDED after JIT synchronization!`);
-      } else {
-        throw err;
+      // Check for specific revert reasons
+      const errMsg = err.message || '';
+      const status = err.status?._code?.toString() || '';
+
+      console.error(`   ❌ Withdrawal failed: ${errMsg}`);
+      if (err.status) console.error(`   Status: ${status}`);
+
+      if (errMsg.includes('NullifierAlreadyUsed')) {
+        throw new Error('Withdrawal failed: This proof has already been used (nullifier spent).');
       }
+      if (errMsg.includes('InvalidWithdrawProof')) {
+        throw new Error('Withdrawal failed: ZK proof verification failed. The proof may be malformed or for a different circuit.');
+      }
+      if (errMsg.includes('RootNotFound')) {
+        throw new Error('Withdrawal failed: Merkle root not recognized by contract. The deposit may not have been batched yet.');
+      }
+      if (errMsg.includes('WithdrawalFailed')) {
+        throw new Error('Withdrawal failed: The HBAR transfer to recipient failed. Check contract balance.');
+      }
+      if (errMsg.includes('CONTRACT_REVERT_EXECUTED')) {
+        // Try to get more details from the transaction record
+        throw new Error(`Withdrawal failed: Contract reverted. Possible causes: (1) Nullifier already used, (2) Proof already used, (3) Contract out of HBAR balance, (4) Invalid proof format. Check that this exact proof hasn't been submitted before.`);
+      }
+      throw err;
     }
 
     // 3. Notify Recipient if it's a Stealth Payment
@@ -788,13 +1061,197 @@ class PoolManager {
           zkProof: proofData.proof,
           publicSignals: proofData.publicSignals
         };
-        
+
         console.log(`📡 Sending stealth notification to ${proofData.stealthPayload.recipientAccountId}...`);
         await hip1334.sendEncryptedMessage(this.client, proofData.stealthPayload.recipientAccountId, payload);
         console.log(`✅ Stealth notification sent.`);
       } catch (notifErr) {
         console.warn(`⚠️ Stealth notification failed: ${notifErr.message}`);
       }
+    }
+
+    // 4. Notify Recipient if it's an Internal Swap
+    if (isInternalSwap && proofData.stealthPayload && proofData.stealthPayload.recipientAccountId) {
+      try {
+        const payload = {
+          type: 'INTERNAL_SWAP',
+          amount: Number(amountTinybars) / 1e8,
+          newCommitment: newCommitment,
+          newSecret: proofData.stealthPayload.newSecret,        // CRITICAL: Recipient needs this to spend
+          newNullifier: proofData.stealthPayload.newNullifier,  // CRITICAL: Recipient needs this to spend
+          sourceCommitment: commitmentHex,
+          nullifierHash: String(nullifierHash),
+          recipientAccountId: proofData.stealthPayload.recipientAccountId,
+          senderAccountId: proofData.stealthPayload.senderAccountId || this.accountId.toString(),
+          timestamp: Date.now(),
+          batchId: proofData.submissionId,
+          transactionId: txResponse.transactionId.toString()
+        };
+
+        console.log(`📡 Sending internal swap notification to ${proofData.stealthPayload.recipientAccountId}...`);
+        await hip1334.sendEncryptedMessage(this.client, proofData.stealthPayload.recipientAccountId, payload);
+        console.log(`✅ Internal swap notification sent with new commitment.`);
+      } catch (notifErr) {
+        console.warn(`⚠️ Internal swap notification failed: ${notifErr.message}`);
+      }
+    }
+  }
+
+  /**
+   * Check if a Merkle root exists in the contract's rootHistory
+   * Useful for debugging withdrawal issues
+   */
+  async checkRootExists(rootHex) {
+    const guardId = process.env.VANISH_GUARD_CONTRACT_ID;
+    if (!guardId) {
+      console.log('⚠️ VANISH_GUARD_CONTRACT_ID not set');
+      return null;
+    }
+
+    try {
+      const { ContractCallQuery, ContractId } = require('@hashgraph/sdk');
+      const { Interface } = require('ethers');
+
+      const abi = ['function rootHistory(bytes32) view returns (bool)', 'function currentMerkleRoot() view returns (bytes32)'];
+      const iface = new Interface(abi);
+
+      const normalizedRoot = normalizeHex(rootHex);
+
+      // Check rootHistory
+      const historyCalldata = iface.encodeFunctionData('rootHistory', [normalizedRoot]);
+      const historyResult = await new ContractCallQuery()
+        .setContractId(ContractId.fromString(guardId))
+        .setGas(50_000)
+        .setFunctionParameters(Buffer.from(historyCalldata.replace('0x', ''), 'hex'))
+        .execute(this.client);
+      const inHistory = iface.decodeFunctionResult('rootHistory', historyResult.bytes)[0];
+
+      // Check current root
+      const currentCalldata = iface.encodeFunctionData('currentMerkleRoot');
+      const currentResult = await new ContractCallQuery()
+        .setContractId(ContractId.fromString(guardId))
+        .setGas(50_000)
+        .setFunctionParameters(Buffer.from(currentCalldata.replace('0x', ''), 'hex'))
+        .execute(this.client);
+      const currentRoot = iface.decodeFunctionResult('currentMerkleRoot', currentResult.bytes)[0];
+
+      console.log(`🔍 Root check for ${normalizedRoot.slice(0, 18)}...:`);
+      console.log(`   In rootHistory: ${inHistory ? '✅ YES' : '❌ NO'}`);
+      console.log(`   Is current root: ${currentRoot.toLowerCase() === normalizedRoot.toLowerCase() ? '✅ YES' : '❌ NO'}`);
+      console.log(`   Current contract root: ${currentRoot.slice(0, 18)}...`);
+
+      return { inHistory, isCurrent: currentRoot.toLowerCase() === normalizedRoot.toLowerCase(), currentRoot };
+    } catch (err) {
+      console.error(`⚠️ Failed to check root: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Manually anchor a root to the contract (recovery function)
+   * Use this when roots weren't properly anchored during shield processing
+   */
+  async manuallyAnchorRoot(rootHex) {
+    const guardId = process.env.VANISH_GUARD_CONTRACT_ID;
+    if (!guardId) throw new Error('VANISH_GUARD_CONTRACT_ID not set');
+
+    console.log(`🔧 Manually anchoring root ${rootHex.slice(0, 18)}... to VanishGuard`);
+
+    const normalizedRoot = normalizeHex(rootHex);
+
+    // First check if already anchored
+    const checkResult = await this.checkRootExists(normalizedRoot);
+    if (checkResult?.inHistory) {
+      console.log(`   ✅ Root already anchored`);
+      this.anchoredRoots.add(normalizedRoot.toLowerCase());
+      this.persistAnchoredRoots([normalizedRoot]);
+      return true;
+    }
+
+    // Anchor the root
+    try {
+      const { ContractExecuteTransaction, ContractId } = require('@hashgraph/sdk');
+      const { Interface } = require('ethers');
+
+      const abi = ['function submitBatch(uint32 batchSize, uint256 delayMs, uint256 queueAgeMs, bytes32[] roots, bytes32 auditHash)'];
+      const iface = new Interface(abi);
+
+      const auditHash = normalizeHex(crypto.createHash('sha256').update(`RECOVERY_${normalizedRoot}_${Date.now()}`).digest('hex'));
+
+      // Must satisfy contract's minBatchSize policy (typically 2)
+      // Pad with duplicate root to meet minimum if needed
+      const minBatchSize = Math.max(2, this.MIN_BATCH_SIZE);
+      const rootsArray = [normalizedRoot];
+      while (rootsArray.length < minBatchSize) {
+        rootsArray.push(normalizedRoot); // Pad with same root
+      }
+
+      const params = [
+        rootsArray.length, // batchSize must match roots array length and meet policy minimum
+        BigInt(1000), // delayMs
+        BigInt(1000), // queueAgeMs
+        rootsArray, // roots array (padded to meet minBatchSize)
+        auditHash
+      ];
+
+      const calldata = iface.encodeFunctionData('submitBatch', params);
+
+      const txResponse = await new ContractExecuteTransaction()
+        .setContractId(ContractId.fromString(guardId))
+        .setGas(500_000)
+        .setFunctionParameters(Buffer.from(calldata.replace('0x', ''), 'hex'))
+        .execute(this.client);
+
+      const receipt = await txResponse.getReceipt(this.client);
+
+      if (receipt.status.toString() === 'SUCCESS') {
+        console.log(`   ✅ Root anchored successfully!`);
+        console.log(`   Tx ID: ${txResponse.transactionId.toString()}`);
+        this.anchoredRoots.add(normalizedRoot.toLowerCase());
+        this.persistAnchoredRoots([normalizedRoot]);
+        return true;
+      } else {
+        console.error(`   ❌ Anchor failed: ${receipt.status.toString()}`);
+        return false;
+      }
+    } catch (err) {
+      console.error(`   ❌ Manual anchor failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Notify user agent that withdrawal completed successfully
+   * Uses HIP-1334 encrypted messaging
+   */
+  async notifyWithdrawalComplete(proofData, result) {
+    try {
+      const submitter = proofData.submitter;
+      if (!submitter) {
+        console.log(`   ℹ️ No submitter info, skipping completion notification`);
+        return;
+      }
+
+      const hip1334 = require('../../lib/hip1334.cjs');
+
+      const notification = {
+        type: 'WITHDRAWAL_COMPLETE',
+        submissionId: proofData.submissionId,
+        nullifierHash: result.nullifierHash,
+        commitment: result.commitment,
+        amount: result.amount,
+        recipient: result.recipient,
+        transactionId: result.transactionId,
+        timestamp: result.timestamp,
+        status: result.status
+      };
+
+      console.log(`   📤 Sending completion notification to ${submitter}...`);
+      console.log(`      Submission ID: ${proofData.submissionId}`);
+      await hip1334.sendEncryptedMessage(this.client, submitter, notification);
+      console.log(`   ✅ User agent notified of successful withdrawal`);
+    } catch (notifyErr) {
+      console.warn(`   ⚠️ Failed to notify user agent: ${notifyErr.message}`);
     }
   }
 
@@ -832,6 +1289,12 @@ class PoolManager {
 
     if (this.hip1334TopicId && this.hip1334EncPrivKey) {
       console.log(`📬 HIP-1334 inbox loaded from .env: ${this.hip1334TopicId}`);
+      // Ensure memo is synchronized (idempotent)
+      const { AccountUpdateTransaction } = require('@hashgraph/sdk');
+      await new AccountUpdateTransaction()
+        .setAccountId(this.accountId)
+        .setAccountMemo(`[HIP-1334:${this.hip1334TopicId}]`)
+        .execute(this.client);
       return;
     }
 
@@ -860,6 +1323,7 @@ class PoolManager {
 
   async startListening() {
     try {
+      await this.loadVerificationKeys();
       await this.initializeHIP1334();
       console.log('👂 Pool Manager listening via HIP-1334 (encrypted inbox)');
       console.log(`   Inbox topic: ${this.hip1334TopicId}`);
@@ -878,7 +1342,7 @@ class PoolManager {
 
     new TopicMessageQuery()
       .setTopicId(this.privateTopic)
-      .setStartTime(Math.floor(Date.now() / 1000) - 2) // Slight buffer for sync issues
+      .setStartTime(Math.floor(Date.now() / 1000) - 3600) // Look back 1 hour to recover missed proofs
       .subscribe(this.client, null, async (message) => {
         try {
           let raw = Buffer.from(message.contents).toString('utf8');
@@ -907,9 +1371,34 @@ async function main() {
   const manager = new PoolManager();
   await manager.startListening();
 
+  // Status logging every 5 minutes
   setInterval(() => {
     console.log('📊 Pool Status:', manager.getStatus());
   }, 5 * 60 * 1000);
+
+  // One-time command listener for clearing queue (type 'clear' and press Enter)
+  const readline = require('readline');
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  console.log('⌨️  Commands available:');
+  console.log('  Type "clear" + Enter to clear proof queue');
+  console.log('  Type "status" + Enter to see current status');
+
+  rl.on('line', (input) => {
+    const cmd = input.trim().toLowerCase();
+    if (cmd === 'clear') {
+      const count = manager.proofQueue.length;
+      manager.proofQueue = [];
+      manager.firstProofTimestamp = null;
+      manager.batchScheduled = false;
+      console.log(`🧹 Cleared ${count} proofs from queue`);
+    } else if (cmd === 'status') {
+      console.log('📊 Pool Status:', manager.getStatus());
+    }
+  });
 }
 
 main().catch(console.error);

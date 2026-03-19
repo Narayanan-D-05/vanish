@@ -64,10 +64,17 @@ class UserAgent {
     this.vault = new VaultWrapper(this.secretsPath);
     this.userSecrets = new Map(); // Full secrets cache (decrypted)
     this.blindedVault = {}; // What the AI sees
-    
+
+    // Track pending withdrawals (submitted but not yet confirmed on-chain)
+    this.pendingPath = path.join(__dirname, '..', '..', 'pending_withdrawals.json');
+    this.pendingWithdrawals = this.loadPendingWithdrawals();
+
     // For demo: Use a default password or prompt (In 2026, this is derived from biometrics/HW)
     this.vaultPassword = process.env.VAULT_PASSWORD || 'vanish2026';
     this.loadSecrets();
+
+    // Start listening for completion notifications
+    this.startListeningForCompletions();
 
     // Determine mode
     this.aiMode = useAI && ChatOllama && createReactAgent;
@@ -98,7 +105,9 @@ class UserAgent {
     console.log('\n💬 Available commands:');
     console.log('     - status           - Check pool status');
     console.log('     - balance          - Check your HBAR balance');
+    console.log('     - shields          - List your shielded funds in pool 💰');
     console.log('     - transfer <to> <amount> - Send HBAR (e.g., transfer 0.0.123456 10)');
+    console.log('     - internal-transfer <to> <amt> - Send within pool (Muted/Max Privacy) 🤫');
     console.log('     - ai-shield <amount>     - AI-powered smart shield (THINKS!) 🧠');
     console.log('     - ai-plan <amount>       - Let AI analyze strategy');
     console.log('     - consult <amount>       - Ask AI for advice');
@@ -111,7 +120,117 @@ class UserAgent {
     console.log('     - exit                   - Exit agent');
     console.log('\n---\n');
   }
-  
+
+  /**
+   * Load pending withdrawals from file
+   */
+  loadPendingWithdrawals() {
+    try {
+      if (fs.existsSync(this.pendingPath)) {
+        const data = JSON.parse(fs.readFileSync(this.pendingPath, 'utf8'));
+        console.log(`📂 Loaded ${data.length} pending withdrawals`);
+        return new Map(data.map(p => [p.secretId, p]));
+      }
+    } catch (e) {
+      console.error(`⚠️ Failed to load pending withdrawals: ${e.message}`);
+    }
+    return new Map();
+  }
+
+  /**
+   * Save pending withdrawals to file
+   */
+  savePendingWithdrawals() {
+    try {
+      const data = Array.from(this.pendingWithdrawals.values());
+      fs.writeFileSync(this.pendingPath, JSON.stringify(data, null, 2));
+    } catch (e) {
+      console.error(`⚠️ Failed to save pending withdrawals: ${e.message}`);
+    }
+  }
+
+  /**
+   * Start listening for withdrawal completion notifications via HIP-1334
+   */
+  startListeningForCompletions() {
+    if (this.pendingWithdrawals.size > 0) {
+      console.log(`⏳ ${this.pendingWithdrawals.size} withdrawals pending completion`);
+    }
+
+    // Get HIP-1334 inbox config
+    const inboxTopicId = process.env.HIP1334_TOPIC_ID;
+    const encPrivateKey = process.env.HIP1334_ENC_PRIV_KEY;
+
+    if (!inboxTopicId || !encPrivateKey) {
+      console.warn('⚠️  HIP-1334 inbox not configured - cannot receive completion notifications');
+      console.warn('   Set HIP1334_TOPIC_ID and HIP1334_ENC_PRIV_KEY in .env');
+      return;
+    }
+
+    // Start listening for encrypted messages
+    try {
+      hip1334.listenToInbox(this.client, inboxTopicId, encPrivateKey, async (payload) => {
+        console.log(`📨 Received HIP-1334 message: ${payload.type}`);
+        if (payload.type === 'WITHDRAWAL_COMPLETE') {
+          this.handleWithdrawalComplete(payload);
+        }
+      });
+      console.log(`📬 Listening for completion notifications on ${inboxTopicId}`);
+    } catch (err) {
+      console.error('❌ Failed to start completion listener:', err.message);
+    }
+  }
+
+  /**
+   * Handle withdrawal completion notification
+   */
+  handleWithdrawalComplete(notification) {
+    const { submissionId, nullifierHash, status } = notification;
+
+    // Find the pending withdrawal
+    for (const [secretId, pending] of this.pendingWithdrawals) {
+      if (pending.submissionId === submissionId) {
+        if (status === 'SUCCESS') {
+          console.log(`\n✅ Withdrawal completed for secret ${secretId}!`);
+          console.log(`   Transaction: ${notification.transactionId}`);
+          console.log(`   Amount: ${notification.amount} HBAR`);
+
+          // Mark secret as used
+          const secret = this.userSecrets.get(secretId);
+          if (secret) {
+            secret.used = true;
+            this.saveSecrets();
+          }
+
+          // Remove from pending
+          this.pendingWithdrawals.delete(secretId);
+          this.savePendingWithdrawals();
+        } else {
+          console.log(`\n❌ Withdrawal failed for secret ${secretId}: ${status}`);
+          // Remove from pending so it can be retried
+          this.pendingWithdrawals.delete(secretId);
+          this.savePendingWithdrawals();
+        }
+        return;
+      }
+    }
+
+    // No matching pending withdrawal found
+    console.warn(`⚠️  Received completion notification for unknown submission: ${submissionId}`);
+    console.warn(`   Pending withdrawals: ${this.pendingWithdrawals.size}`);
+    if (this.pendingWithdrawals.size > 0) {
+      const pendingIds = Array.from(this.pendingWithdrawals.values()).map(p => p.submissionId);
+      console.warn(`   Expected one of: ${pendingIds.join(', ')}`);
+    }
+  }
+
+  /**
+   * Check if a secret is already pending withdrawal
+   */
+  isSecretPending(secretId) {
+    return this.pendingWithdrawals.has(secretId);
+  }
+
   /**
    * Parse and execute direct commands (no AI needed)
    */
@@ -123,6 +242,13 @@ class UserAgent {
       switch (command) {
         case 'status':
           return await this.queryPoolStatus();
+
+        case 'shields':
+        case 'vault':
+          return this.listUserShieldedFunds();
+
+        case 'debug-vault':
+          return this.debugVault();
         
         case 'balance':
           const accountToCheck = parts[1]; // Optional account ID
@@ -178,22 +304,32 @@ class UserAgent {
         
         case 'withdraw':
           if (parts.length < 3) {
-            return '❌ Invalid usage. Usage: withdraw <recipientAccountId> <amount> [secretId]\n   Example: withdraw 0.0.123456 10';
+            return '❌ Invalid usage. Usage: withdraw <amount> <recipient> OR withdraw <secretId> <recipient> <amount>\n   Example: withdraw 10 0.0.123456';
           }
-          let withdrawRecipient, withdrawAmount, wSecretId;
           
-          if (parts.length >= 4) {
-            // Manual mode: withdraw <secretId> <recipient> <amount> (backwards compat)
-            wSecretId = parts[1];
-            withdrawRecipient = parts[2];
-            withdrawAmount = parseFloat(parts[3]);
+          let wRecipient, wAmount, wSid;
+          
+          // Type-Intelligent Parsing
+          const arg1 = parts[1];
+          const arg2 = parts[2];
+          const arg1IsAmount = !isNaN(parseFloat(arg1)) && !arg1.includes('frag_') && !arg1.includes('0.0.');
+          
+          if (arg1IsAmount && parts.length === 3) {
+            // Pattern: withdraw <amount> <recipient>
+            wAmount = parseFloat(arg1);
+            wRecipient = arg2;
+          } else if (parts.length >= 4) {
+            // Pattern: withdraw <secretId> <recipient> <amount>
+            wSid = arg1;
+            wRecipient = arg2;
+            wAmount = parseFloat(parts[3]);
           } else {
-            // Automated mode: withdraw <recipient> <amount>
-            withdrawRecipient = parts[1];
-            withdrawAmount = parseFloat(parts[2]);
+            // Pattern: withdraw <recipient> <amount> (legacy/fallback)
+            wRecipient = arg1;
+            wAmount = parseFloat(arg2);
           }
           
-          return await this.withdrawFunds(withdrawRecipient, withdrawAmount, wSecretId);
+          return await this.withdrawFunds(wRecipient, wAmount, wSid);
         
         case 'shield':
           const amount = parseFloat(parts[1]);
@@ -250,6 +386,11 @@ class UserAgent {
         case 'transfer':
           if (parts.length < 3) return "❌ Usage: transfer <to> <amount>";
           return await this.transferHbar(parts[1], parseFloat(parts[2]));
+          
+        case 'internal-transfer':
+        case 'swap':
+          if (parts.length < 3) return "❌ Usage: internal-transfer <recipientAccount> <amount>";
+          return await this.autoInternalSwap(parts[1], parseFloat(parts[2]));
           
         case 'help':
           return this.showHelp();
@@ -314,7 +455,85 @@ class UserAgent {
     }
     return `❌ ${data.error}`;
   }
-  
+
+  /**
+   * List user's shielded funds (unspent fragments in pool)
+   * Reads from live userSecrets Map (not cached blindedVault)
+   */
+  listUserShieldedFunds() {
+    // Read from userSecrets Map (source of truth) not cached blindedVault
+    const unspent = [];
+    for (const [id, data] of this.userSecrets.entries()) {
+      const isUsed = data.used === true;
+      const amount = typeof data === 'object' ? data.amount : 0;
+      if (!isUsed && amount > 0) {
+        unspent.push({ id, amount });
+      }
+    }
+
+    const total = unspent.reduce((sum, f) => sum + f.amount, 0);
+
+    if (unspent.length === 0) {
+      return `💰 Your Vanish Vault:\n   No unspent shielded funds.\n   Use 'shield' or 'ai-shield' to deposit.`;
+    }
+
+    let output = `💰 Your Vanish Vault:\n`;
+    output += `   Total: ${total} HBAR in ${unspent.length} fragment(s)\n\n`;
+    output += `   Fragments:\n`;
+    unspent.forEach(f => {
+      output += `      • ${f.id}: ${f.amount} HBAR\n`;
+    });
+    output += `\n   💡 Use 'withdraw <secretId> <recipient> <amount>' to spend\n`;
+    output += `   💡 Use 'internal-transfer <recipient> <amount>' for private P2P`;
+
+    return output;
+  }
+
+  /**
+   * Debug vault - show all secrets and their used status
+   */
+  debugVault() {
+    const entries = [];
+    for (const [id, data] of this.userSecrets.entries()) {
+      entries.push({
+        id,
+        used: data.used === true,
+        amount: data.amount || 0,
+        hasSecret: !!data.secret,
+        hasNullifier: !!data.nullifier
+      });
+    }
+
+    const usedCount = entries.filter(e => e.used).length;
+    const unspentCount = entries.filter(e => !e.used).length;
+    const totalUnspent = entries.filter(e => !e.used).reduce((sum, e) => sum + e.amount, 0);
+
+    let output = `🔍 Vault Debug:\n`;
+    output += `   Total entries: ${entries.length}\n`;
+    output += `   Used (spent): ${usedCount}\n`;
+    output += `   Unspent: ${unspentCount} (${totalUnspent} HBAR)\n\n`;
+
+    // Show first 10 unspent
+    const unspent = entries.filter(e => !e.used).slice(0, 10);
+    if (unspent.length > 0) {
+      output += `   First ${unspent.length} unspent fragments:\n`;
+      unspent.forEach(e => {
+        output += `      • ${e.id}: ${e.amount} HBAR (used=${e.used})\n`;
+      });
+    }
+
+    // Show first 5 used
+    const used = entries.filter(e => e.used).slice(0, 5);
+    if (used.length > 0) {
+      output += `\n   First ${used.length} used (spent) fragments:\n`;
+      used.forEach(e => {
+        output += `      • ${e.id}: ${e.amount} HBAR (used=${e.used})\n`;
+      });
+    }
+
+    return output;
+  }
+
   loadSecrets(password = this.vaultPassword) {
     try {
       const data = this.vault.decrypt(password);
@@ -616,9 +835,14 @@ class UserAgent {
    */
   async autoInternalSwap(recipientAccountId, amount) {
     console.log(`🔒 AUTO Internal Swap: Pool -> Pool (Recipient: ${recipientAccountId}, ${amount} HBAR)\n`);
-    
-    // 1. Find exact fragments (using Blinded Vault)
-    const unspent = Object.values(this.blindedVault).filter(v => !v.used);
+
+    // 1. Find exact fragments (using live userSecrets Map, not cached blindedVault)
+    const unspent = [];
+    for (const [id, data] of this.userSecrets.entries()) {
+      if (data.used !== true) {
+        unspent.push({ id, amount: data.amount || 0 });
+      }
+    }
     
     const findExact = (target, available) => {
       available.sort((a,b) => b.amount - a.amount);
@@ -658,8 +882,13 @@ class UserAgent {
         results += `   ❌ Fragment [${frag.id}]: failed\n`;
       } else {
         const sec = this.userSecrets.get(frag.id);
-        sec.used = true;
-        this.saveSecrets();
+        if (sec) {
+          sec.used = true;
+          this.saveSecrets();
+          console.log(`   🔒 Marked ${frag.id} as used in vault`);
+        } else {
+          console.warn(`   ⚠️ Could not mark ${frag.id} as used - not found in vault`);
+        }
         results += `   ✅ Fragment [${frag.id}]: Swapped ${frag.amount} HBAR internally\n`;
       }
     }
@@ -722,16 +951,23 @@ class UserAgent {
     console.log(`💡 Safer Alternative: Stay inside the pool. Use 'internal-transfer' for peer-to-peer privacy.\n`);
     console.log(`✅ HIP-1340 Protection: The Pool Manager will pay the gas for this withdrawal to decouple your wallets.\n`);
 
-    // 2. Secret Resolution (using Blinded Vault)
+    // 2. Secret Resolution (using live userSecrets Map, not cached blindedVault)
     let selectedSecretIds = [];
     if (secretId) {
+      // Check if already pending
+      if (this.isSecretPending(secretId)) {
+        return `⏳ Secret ${secretId} is already pending withdrawal. Wait for completion.`;
+      }
       selectedSecretIds = [secretId];
     } else {
-      console.log(`🔍 Searching local blinded vault for matching HBAR fragments (Aggregation Mode)...`);
-      const available = Object.entries(this.blindedVault)
-        .filter(([sid, data]) => !data.used)
-        .map(([sid, data]) => ({ id: sid, amount: data.amount }));
-      
+      console.log(`🔍 Searching live vault for matching HBAR fragments (Aggregation Mode)...`);
+      const available = [];
+      for (const [id, data] of this.userSecrets.entries()) {
+        if (data.used !== true && !this.isSecretPending(id)) {
+          available.push({ id, amount: data.amount || 0 });
+        }
+      }
+
       const subset = this.findExactSubset(amount, available);
       if (subset) {
         selectedSecretIds = subset.map(s => s.id);
@@ -749,7 +985,11 @@ class UserAgent {
 
     let totalSuccess = 0;
     for (const sid of selectedSecretIds) {
-      const fragData = this.blindedVault[sid];
+      const fragData = this.userSecrets.get(sid);
+      if (!fragData) {
+        console.error(`❌ Fragment ${sid} not found in vault.`);
+        continue;
+      }
       console.log(`🛡️  Withdrawing fragment ${sid} (${fragData.amount} HBAR) to ${recipient}...\n`);
       
       const secret = this.userSecrets.get(sid);
@@ -806,10 +1046,18 @@ class UserAgent {
         const finalData = JSON.parse(submitRes);
         if (finalData.success) {
           totalSuccess++;
-          // Mark as used immediately to avoid double spend
-          const realSec = this.userSecrets.get(sid);
-          if (realSec) realSec.used = true;
-          this.saveSecrets();
+          // Add to pending withdrawals instead of marking as used immediately
+          // Will be marked as used when Pool Manager confirms completion
+          this.pendingWithdrawals.set(sid, {
+            secretId: sid,
+            submissionId: finalData.submissionId || crypto.randomBytes(16).toString('hex'),
+            amount: fragAmount,
+            recipient: recipient,
+            submittedAt: Date.now(),
+            status: 'PENDING'
+          });
+          this.savePendingWithdrawals();
+          console.log(`   ⏳ Added to pending withdrawals (will mark as used when confirmed)`);
         }
       }
     }
@@ -863,7 +1111,7 @@ class UserAgent {
       this.saveSecrets();
       
       console.log(`   📤 Submitting to Pool Manager...`);
-      const submitted = await this.submitProofToPoolManager({
+      const submitResult = await this.submitProofToPoolManager({
         proof: data.proof,
         publicSignals: data.publicSignals,
         commitment: data.commitment,
@@ -871,17 +1119,30 @@ class UserAgent {
         amount: amount
       });
 
+      // Track pending withdrawal for completion notification
+      if (submitResult.success && submitResult.submissionId) {
+        this.pendingWithdrawals.set(secretId, {
+          secretId: secretId,
+          submissionId: submitResult.submissionId,
+          amount: amount,
+          recipient: null,
+          submittedAt: Date.now(),
+          status: 'PENDING'
+        });
+        this.savePendingWithdrawals();
+      }
+
       return `✅ Shield Proof Generated!
    Commitment: ${data.commitment}
    Nullifier Hash: ${data.nullifierHash}
-   
+
    🔑 YOUR SECRET (SAVE THIS!):
    Secret ID: ${secretId}
    Secret: ${secret}
-   
+
    ⚠️  You MUST save this secret to withdraw funds later!
-   
-   📤 Proof submitted to Pool Manager: ${submitted ? 'SUCCESS' : 'FAILED'}
+
+   📤 Proof submitted to Pool Manager: ${submitResult.success ? 'SUCCESS' : 'FAILED'}
    ⏱️  Will be processed in next batch (5-30 minutes)`;
     }
     
@@ -964,21 +1225,35 @@ class UserAgent {
           
           // Submit proof to Pool Manager
           console.log(`       📤 Submitting to Pool Manager...`);
-          const submitted = await this.submitProofToPoolManager({
+          const submitResult = await this.submitProofToPoolManager({
             proof: data.proof,
             publicSignals: data.publicSignals,
             commitment: data.commitment,
             nullifierHash: data.nullifierHash,
             amount: fragmentAmount
           });
-          
+
+          // Track pending withdrawal for completion notification
+          if (submitResult.success && submitResult.submissionId) {
+            this.pendingWithdrawals.set(secretData.secretId, {
+              secretId: secretData.secretId,
+              submissionId: submitResult.submissionId,
+              amount: fragmentAmount,
+              recipient: null,
+              submittedAt: Date.now(),
+              status: 'PENDING'
+            });
+            this.savePendingWithdrawals();
+          }
+
           results.push({
             fragmentId: i + 1,
             amount: fragmentAmount,
             commitment: data.commitment,
             nullifierHash: data.nullifierHash,
             secretId: secretData.secretId,
-            submitted: submitted,
+            submitted: submitResult.success,
+            submissionId: submitResult.submissionId,
             success: true
           });
         } else {
@@ -1047,19 +1322,23 @@ class UserAgent {
     console.log('💭 Agent is thinking about optimal strategy...\n');
     console.log('━'.repeat(60) + '\n');
 
-    // [THOUGHT] Agent initiates reasoning about optimal strategy
-    this.logger.thought(`Analyzing fragmentation strategy for ${amount} HBAR`, {
+    // [THOUGHT] Agent initiates reasoning with REAL NETWORK STATE
+    console.log('🌐 Fetching real-time network state (Pool Anonymity Set, Gas)...');
+    const statusResult = await this.queryPoolStatus();
+    const isSuccess = !statusResult.startsWith('❌');
+    
+    this.logger.thought(`Analyzing fragmentation strategy for ${amount} HBAR with network context`, {
       privacyLevel: 'moderate',
-      costSensitive: false,
-      userType: 'regular'
+      networkAware: true,
+      poolStatus: isSuccess ? 'online' : 'fallback'
     });
 
     try {
-      // AI analyzes and creates plan
+      // AI analyzes and creates plan using real-time context
       const plan = await aiFragmentor.analyzeFragmentationStrategy(amount, {
         privacyLevel: 'moderate',
-        costSensitive: false,
-        userType: 'regular'
+        networkState: statusResult,
+        timestamp: new Date().toISOString()
       });
 
       // [LOGIC] AI provides reasoning trace
@@ -1079,15 +1358,28 @@ class UserAgent {
         { strategy: plan.aiStrategy || plan.strategy }
       );
 
-      // Display AI reasoning
+      // Display AI reasoning with Network Observation
       if (plan.aiPowered) {
-        console.log('🎯 AI Decision:\n');
+        console.log('🎯 AI Network Observation:\n');
+        console.log(`   "${plan.aiReasoning}"`);
+        console.log(`\n📊 Fragmentation Strategy:`);
         console.log(`   Strategy: ${plan.aiStrategy}`);
         console.log(`   Fragments: ${plan.numFragments}`);
-        console.log(`\n💡 AI Justification:\n`);
-        console.log(`   Cost: ${plan.costJustification}`);
-        console.log(`   Privacy: ${plan.privacyBenefit}`);
+        console.log(`\n💡 AI Justification: ${plan.privacyBenefit}`);
         console.log('\n' + '━'.repeat(60) + '\n');
+      }
+
+      // 1. BATCHED DELEGATION (HIP-1340) - One transaction for the total amount to save fees!
+      const poolManagerId = process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID || process.env.POOL_CONTRACT_ID;
+      if (poolManagerId !== this.accountId.toString()) {
+        console.log(`💰 Batching delegation for ${amount} HBAR...`);
+        const delegation = new DelegationManager(this.client);
+        await delegation.delegateSpendingRights(
+          this.accountId.toString(),
+          poolManagerId,
+          amount + 0.1 // Add 0.1 HBAR buffer for any rounding
+        );
+        console.log(`✅ Batched allowance: ${amount + 0.1} HBAR → Pool Manager`);
       }
 
       // Generate secrets and proofs
@@ -1130,21 +1422,36 @@ class UserAgent {
             
             // Submit proof to Pool Manager
             console.log(`       📤 Submitting to Pool Manager...`);
-            const submitted = await this.submitProofToPoolManager({
+            const submitResult = await this.submitProofToPoolManager({
               proof: data.proof,
               publicSignals: data.publicSignals,
               commitment: data.commitment,
               nullifierHash: data.nullifierHash,
-              amount: plan.fragmentAmounts[i]
+              amount: plan.fragmentAmounts[i],
+              skipDelegation: true // Already batched above!
             });
-            
+
+            // Track pending withdrawal for completion notification
+            if (submitResult.success && submitResult.submissionId) {
+              this.pendingWithdrawals.set(secretId, {
+                secretId: secretId,
+                submissionId: submitResult.submissionId,
+                amount: plan.fragmentAmounts[i],
+                recipient: null,
+                submittedAt: Date.now(),
+                status: 'PENDING'
+              });
+              this.savePendingWithdrawals();
+            }
+
             results.push({
               success: true,
               fragmentId: i + 1,
               amount: plan.fragmentAmounts[i],
               commitment: data.commitment,
               secretId: secretId,
-              submitted: submitted,
+              submitted: submitResult.success,
+              submissionId: submitResult.submissionId,
               transactionId: data.transactionId
             });
           } else {
@@ -1184,12 +1491,13 @@ class UserAgent {
       });
       
       if (successful > 0) {
-        output += `\n🔑 SAVE THESE SECRET IDs:\n`;
+        output += `\n🔑 SECRET IDs (Auto-saved to vault):\n`;
         results.filter(r => r.success).forEach(r => {
           output += `   Fragment ${r.fragmentId}: ${r.secretId}\n`;
         });
         
-        output += `\n⚠️  You MUST save these to withdraw funds later!\n`;
+        output += `\n💡 Your agent has saved these to your encrypted vault.`;
+        output += `\n💡 You only need to save these manually for backup or migration.`;
         output += `\n📤 All ${successful} proofs submitted to Pool Manager`;
         output += `\n🧠 Privacy: ${plan.metrics.privacyScore}% (AI-optimized anonymity)`;
         output += `\n💰 Cost: $${plan.costs.total.toFixed(4)}`;
@@ -1439,8 +1747,9 @@ WORKFLOW:
   2. ai-plan 100           - See AI's strategy
   3. ai-shield 100         - Execute AI-optimized shield
   4. Save secret IDs       - You'll need them to withdraw!
-  3. Wait for batch to execute (5-30 minutes)
-  4. SAVE your secret for withdrawal!
+  5. OPTIONAL: internal-transfer <to> <amt> - Send within pool! 🤫
+  6. Wait for batch to execute (5-30 minutes)
+  7. SAVE your secret for withdrawal!
 
 PRIVACY NOTES:
   • Secrets generated locally, never transmitted
@@ -1494,12 +1803,12 @@ Be concise, technical, and privacy-focused in your responses.`;
     // HYBRID MODE: Check if this is a direct protocol command even in AI mode
     // This prevents the AI from entering infinite loops for standard operations.
     const directCommands = [
-      'status', 'balance', 'shields', 'check-balance', 'transfer', 'ai-shield', 'ai-plan', 
-      'consult', 'shield-smart', 'plan', 'shield', 'stealth', 'withdraw', 'help'
+      'status', 'balance', 'shields', 'check-balance', 'transfer', 'internal-transfer', 'ai-shield', 'ai-plan',
+      'consult', 'shield-smart', 'plan', 'shield', 'stealth', 'withdraw', 'help', 'debug-vault'
     ];
 
     if (directCommands.includes(command)) {
-      this.logger.logic(`Bypassing LLM loop for direct protocol command: ${command}`);
+      console.log(`🔹 [LOGIC] Bypassing LLM loop for direct protocol command: ${command}`);
       return await this.executeDirectCommand(userInput);
     }
 
@@ -1557,8 +1866,9 @@ Be concise, technical, and privacy-focused in your responses.`;
       // HIP-1340: Approve pool manager to pull this fragment's HBAR amount
       const poolManagerId = process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID || process.env.POOL_CONTRACT_ID;
       
-      // If we are the pool manager (same account dev loop), delegation is redundant and would error via "Spender Same as Owner"
-      if (poolManagerId !== this.accountId.toString()) {
+      // If we are the pool manager (same account dev loop), delegation is redundant
+      // If skipDelegation is true, the caller already handled it (batched)
+      if (poolManagerId !== this.accountId.toString() && !proofData.skipDelegation) {
         const delegation = new DelegationManager(this.client);
         await delegation.delegateSpendingRights(
           this.accountId.toString(),
@@ -1566,14 +1876,19 @@ Be concise, technical, and privacy-focused in your responses.`;
           proofData.amount
         );
         console.log(`   🔑 HIP-1340 allowance: ${proofData.amount} HBAR → Pool Manager (${poolManagerId})`);
+      } else if (proofData.skipDelegation) {
+        // Silently continue, allowance already handled
       } else {
         console.log(`   💡 Dev Mode: Skipping delegation (User == Pool Manager)`);
       }
 
+      // Use provided submissionId or generate new one
+      const submissionId = proofData.submissionId || crypto.randomBytes(16).toString('hex');
+
       const payload = {
         type: 'PROOF_SUBMISSION',
         proofType: proofData.proofType || 'shield',
-        submissionId: crypto.randomBytes(16).toString('hex'),
+        submissionId: submissionId,
         timestamp: Date.now(),
         proof: proofData.proof,
         publicSignals: proofData.publicSignals,
@@ -1581,13 +1896,13 @@ Be concise, technical, and privacy-focused in your responses.`;
         nullifierHash: proofData.nullifierHash,
         amount: proofData.amount,
         recipient: proofData.recipient,
-        submitter: this.accountId.toString()
+        submitter: proofData.submitter || this.accountId.toString()
       };
 
       // HIP-1334: Send encrypted to Pool Manager's inbox (discovered via Mirror Node)
       try {
         await hip1334.sendEncryptedMessage(this.client, poolManagerId, payload);
-        console.log(`   📨 Proof sent via HIP-1334 (encrypted)`);
+        console.log(`   📨 Proof sent via HIP-1334 (encrypted) - Submission ID: ${submissionId}`);
       } catch (hip1334Err) {
         // Fallback: raw HCS private topic if Pool Manager inbox not yet set up
         console.warn(`   ⚠️  HIP-1334 unavailable (${hip1334Err.message}), using raw HCS`);
@@ -1595,13 +1910,14 @@ Be concise, technical, and privacy-focused in your responses.`;
           .setTopicId(this.privateTopic)
           .setMessage(JSON.stringify(payload));
         await transaction.execute(this.client);
-        console.log(`   📤 Proof sent via raw HCS (fallback)`);
+        console.log(`   📤 Proof sent via raw HCS (fallback) - Submission ID: ${submissionId}`);
       }
 
-      return true;
+      // Return the submissionId so caller can track pending withdrawals
+      return { success: true, submissionId };
     } catch (error) {
       console.error(`   ❌ Submission failed: ${error.message}`);
-      return false;
+      return { success: false, submissionId: null };
     }
   }
 
@@ -1708,10 +2024,22 @@ async function checkOllama() {
 // Start User Agent
 async function main() {
   console.log('🚀 Starting Vanish User Agent...\n');
-  
+
+  // Check for force direct mode
+  const forceDirect = process.argv.includes('--direct') ||
+                      process.argv.includes('-d') ||
+                      process.env.FORCE_DIRECT_MODE === 'true';
+
+  if (forceDirect) {
+    console.log('💡 Starting in Direct mode (forced via flag/env)\n');
+    const agent = new UserAgent(false);
+    await agent.startChat();
+    return;
+  }
+
   // Check if Ollama is available
   const ollamaRunning = await checkOllama();
-  
+
   if (ollamaRunning) {
     console.log('💡 Starting in AI mode (Ollama available)\n');
     const agent = new UserAgent(true);
