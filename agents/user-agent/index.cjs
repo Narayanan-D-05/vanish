@@ -1304,99 +1304,128 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   /**
    * Execute actual sweep transaction from stealth address to main account
    */
-  async executeSweepTransaction(stealthAddress, recipientAccountId, amount, stealthPrivateKey) {
-    try {
-      // Ensure amount is a proper number
-      const amountNum = parseFloat(amount);
-      if (isNaN(amountNum) || amountNum <= 0) {
-        return {
-          success: false,
-          error: `Invalid amount: ${amount}`
-        };
-      }
+  /**
+   * [SPONSORED SWEEP] Send pre-signed sweep tx to Pool Manager as relayer.
+   * Pool Manager adds its fee-payer signature and broadcasts.
+   * On-chain: Fee Payer = Pool Manager — no UserAgent account visible! 🛡️
+   */
+  async sendSponsoredSweepRequest(stealthAddress, recipientAccountId, amount, stealthPrivateKey) {
+    const amountNum = parseFloat(amount);
+    if (isNaN(amountNum) || amountNum <= 0) {
+      return { success: false, error: `Invalid amount: ${amount}` };
+    }
 
+    try {
       console.log(`   🔍 Sweeping ${amountNum} HBAR from stealth address...`);
 
-      // Convert stealth address to Hedera AccountId
       const stealthAccountId = AccountId.fromSolidityAddress(stealthAddress);
-
       console.log(`   🔑 Stealth Account ID: ${stealthAccountId.toString()}`);
 
-      // Use the user's main client (with their actual account as payer)
-      // The stealth account is NOT a real Hedera account - it can't pay for transactions
-      // We use the user's account to pay for the transaction fees
-      const payerClient = this.client;
+      // Get Pool Manager's account ID to use as fee payer
+      const poolManagerAccountId = process.env.POOL_MANAGER_ACCOUNT_ID;
+      if (!poolManagerAccountId) {
+        throw new Error('POOL_MANAGER_ACCOUNT_ID not set in .env');
+      }
+      const poolManagerHederaId = AccountId.fromString(poolManagerAccountId);
 
-      // Check balance first (using mirror node query, doesn't need signature)
+      // Check balance on the stealth address first
       console.log(`   💰 Checking stealth address balance...`);
-      const balanceQuery = new AccountBalanceQuery()
-        .setAccountId(stealthAccountId);
-      const balance = await balanceQuery.execute(payerClient);
-      const balanceStr = balance.hbars.toString();
-      const availableHbar = parseFloat(balanceStr);
-
+      const balance = await new AccountBalanceQuery()
+        .setAccountId(stealthAccountId)
+        .execute(this.client);
+      const availableHbar = parseFloat(balance.hbars.toString());
       console.log(`   📊 Available: ${availableHbar} HBAR, Needed: ${amountNum} HBAR`);
 
-      // Allow small rounding differences (0.001 HBAR buffer for fees)
       if (availableHbar < amountNum - 0.001) {
-        return {
-          success: false,
-          error: `Insufficient balance. Available: ${availableHbar} HBAR, Requested: ${amountNum} HBAR`
-        };
+        return { success: false, error: `Insufficient balance. Available: ${availableHbar} HBAR, Requested: ${amountNum} HBAR` };
       }
-
-      // Use actual available amount if slightly more than requested (to clear account)
       const sweepAmount = Math.min(amountNum, availableHbar);
 
-      // Execute transfer with user's account as payer, but stealth key signs for the sender
-      console.log(`   📤 Executing transfer of ${sweepAmount} HBAR...`);
-      console.log(`   📝 Payer (fee payer): ${this.accountId.toString()}`);
-      console.log(`   🔐 Sender (stealth): ${stealthAccountId.toString()}`);
-      console.log(`   📥 Recipient: ${recipientAccountId}`);
-
-      // Build the transfer transaction
+      // Build the transfer transaction with Pool Manager as fee payer
+      // This is the KEY difference — UserAgent's account never appears on-chain
       const transferTx = new TransferTransaction()
         .addHbarTransfer(stealthAccountId, Hbar.from(-sweepAmount))
         .addHbarTransfer(AccountId.fromString(recipientAccountId), Hbar.from(sweepAmount))
         .setTransactionMemo('Vanish Stealth Claim')
-        // User's account pays for the transaction
-        .setTransactionId(TransactionId.generate(this.accountId))
-        .freezeWith(payerClient);
+        .setTransactionId(TransactionId.generate(poolManagerHederaId)) // Pool Manager is payer!
+        .freezeWith(this.client);
 
-      // Sign with the stealth private key (to authorize transfer FROM stealth address)
-      const signedTx = await transferTx.sign(stealthPrivateKey);
+      // Sign with the stealth private key ONLY (authorises HBAR out of stealth address)
+      // Pool Manager will add its own fee-payer signature
+      const partiallySignedTx = await transferTx.sign(stealthPrivateKey);
 
-      // Also sign with payer's key (to pay for the transaction)
-      const fullySignedTx = await signedTx.sign(this.privateKey);
+      // Serialize to bytes and send to Pool Manager via HIP-1334
+      const txBytes = Buffer.from(partiallySignedTx.toBytes()).toString('base64');
 
-      // Execute the transaction
-      const transaction = await fullySignedTx.execute(payerClient);
-      const receipt = await transaction.getReceipt(payerClient);
+      console.log(`   📤 Sending sponsored sweep request to Pool Manager...`);
+      console.log(`   🔒 Privacy: Fee payer will be Pool Manager (${poolManagerAccountId})`);
 
-      console.log(`   ✅ Sweep complete! Transaction: ${transaction.transactionId.toString()}`);
+      const hip1334 = require('../../lib/hip1334.cjs');
+      await hip1334.sendEncryptedMessage(this.client, poolManagerAccountId, {
+        type: 'SPONSORED_SWEEP',
+        txBytes,
+        stealthAddress,
+        recipientAccountId,
+        amount: sweepAmount,
+        requesterAccountId: this.accountId.toString(),
+        timestamp: Date.now()
+      });
 
-      return {
-        success: true,
-        transactionId: transaction.transactionId.toString(),
-        status: receipt.status.toString(),
-        amount: sweepAmount
-      };
+      console.log(`   ⏳ Sweep request sent. Waiting for SWEEP_COMPLETE notification...`);
+
+      // Wait up to 60s for SWEEP_COMPLETE via the HCS listener
+      return await new Promise((resolve) => {
+        const timeoutMs = 60000;
+        const timeoutId = setTimeout(() => {
+          this.pendingSweeps && this.pendingSweeps.delete(stealthAddress);
+          resolve({ success: false, error: 'Sponsored sweep timed out after 60s. Pool Manager may still process it.' });
+        }, timeoutMs);
+
+        if (!this.pendingSweeps) this.pendingSweeps = new Map();
+        this.pendingSweeps.set(stealthAddress, { resolve, timeoutId });
+      });
     } catch (error) {
-      console.error(`   ❌ Sweep error:`, error.message);
-      return {
-        success: false,
-        error: error.message,
-        details: error.stack
-      };
+      console.error(`   ❌ Sponsored sweep error:`, error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Handle SWEEP_COMPLETE notification from Pool Manager
+   */
+  handleSweepComplete(notification) {
+    if (!this.pendingSweeps) return;
+    const pending = this.pendingSweeps.get(notification.stealthAddress);
+    if (!pending) return;
+
+    clearTimeout(pending.timeoutId);
+    this.pendingSweeps.delete(notification.stealthAddress);
+
+    if (notification.status === 'SUCCESS') {
+      console.log(`✅ Sponsored sweep confirmed!`);
+      console.log(`   Transaction: ${notification.transactionId}`);
+      console.log(`   Amount: ${notification.amount} HBAR sent to ${notification.recipientAccountId}`);
+      pending.resolve({
+        success: true,
+        transactionId: notification.transactionId,
+        status: 'SUCCESS',
+        amount: notification.amount
+      });
+    } else {
+      console.error(`❌ Sponsored sweep failed: ${notification.error}`);
+      pending.resolve({ success: false, error: notification.error });
     }
   }
 
   /**
    * Claim/sweep funds from stealth address to main account
    */
-  async claimStealthTransfer(stealthAddress, amount, ephemeralPublicKey = null) {
+  async claimStealthTransfer(stealthAddress, amount, ephemeralPublicKey = null, evmAddress = null) {
     try {
-      console.log(`\n🔐 Claiming stealth transfer...`);
+      // Prioritize the passed evmAddress, then fall back to AsyncLocalStorage context
+      const targetAddress = evmAddress || (this.sessionContext && this.sessionContext.getStore()) || this.activeSessionAddress;
+      
+      console.log(`\n🔐 Claiming stealth transfer for ${targetAddress || 'global account'}...`);
       console.log(`   From: ${stealthAddress}`);
       console.log(`   Amount: ${amount} HBAR (type: ${typeof amount})`);
 
@@ -1408,9 +1437,15 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
       // Get the ephemeral key
       let sweepKey = ephemeralPublicKey;
+      const secrets = this.getSessionSecrets(targetAddress);
+      
+      // Determine the correct recipient account ID for this session
+      const session = this.sessions.get(targetAddress.toLowerCase());
+      const recipientHederaId = session?.hederaAccountId?.toString() || this.accountId.toString();
+
       if (!sweepKey) {
         console.log(`   🔍 Looking up ephemeral key in vault...`);
-        for (const [id, data] of this.userSecrets.entries()) {
+        for (const [id, data] of secrets.entries()) {
           if (data.stealthAddress === stealthAddress && data.ephemeralPublicKey) {
             sweepKey = data.ephemeralPublicKey;
             console.log(`   ✅ Found ephemeral key in entry: ${id}`);
@@ -1423,11 +1458,12 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         return `⚠️ Cannot claim: Ephemeral public key not found for ${stealthAddress}\n   The funds are there but you need the ephemeral key to claim them.`;
       }
 
-      // Get view key from env - MUST be the private key for X25519
+      // Get view key from session
       // The sender uses our view PUBLIC key, we need our view PRIVATE key
-      const viewKey = process.env.RECEIVER_VIEW_PRIVATE_KEY || process.env.HIP1334_ENC_PRIV_KEY;
+      const keys = this.getSessionKeys(targetAddress);
+      const viewKey = keys.viewKey;
       if (!viewKey) {
-        return `⚠️ Cannot claim: View private key not configured (RECEIVER_VIEW_PRIVATE_KEY or HIP1334_ENC_PRIV_KEY)`;
+        return `⚠️ Cannot claim: View private key not provisioned in active session or .env`;
       }
       
       // Validate it's actually a private key (64 hex chars) not a public key (66 hex chars with 0x04 prefix)
@@ -1453,10 +1489,10 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
       console.log(`   ✅ Derived stealth private key`);
 
-      console.log(`   💸 Executing sweep transaction...`);
-      const result = await this.executeSweepTransaction(
+      console.log(`   💸 Executing sponsored sweep (Pool Manager pays fees)...`);
+      const result = await this.sendSponsoredSweepRequest(
         stealthAddress,
-        this.accountId.toString(),
+        recipientHederaId,
         amountNum,
         stealthPrivateKey
       );
@@ -1465,7 +1501,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         return `✅ Stealth Claim Complete!
    Amount: ${amountNum} HBAR
    From: ${stealthAddress}
-   To: ${this.accountId}
+   To: ${recipientHederaId}
    Transaction: ${result.transactionId}
    Status: ${result.status}`;
       } else {
@@ -1553,12 +1589,38 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   }
 
   /**
+   * Get stealth transfer records from the correct session's vault
+   */
+  getStealthRecords(evmAddress = null) {
+    const records = new Map();
+    const secrets = this.getSessionSecrets(evmAddress);
+    
+    for (const [id, data] of secrets.entries()) {
+      if (data.type === 'stealth_pending' || data.type === 'stealth') {
+        records.set(id, {
+          id,
+          payload: {
+            amount: data.amount,
+            stealthAddress: data.stealthAddress,
+            ephemeralPublicKey: data.ephemeralPublicKey
+          },
+          sender: data.sender,
+          timestamp: data.timestamp,
+          claimed: data.claimed || data.status === 'CLAIMED'
+        });
+      }
+    }
+    return records;
+  }
+
+  /**
    * Manual claim of a stealth transfer
    */
   async manualClaimStealth(stealthId) {
-    const secret = this.userSecrets.get(stealthId);
+    const secrets = this.getSessionSecrets();
+    const secret = secrets.get(stealthId);
     if (!secret) {
-      return `❌ Stealth ID ${stealthId} not found.`;
+      return `❌ Stealth ID ${stealthId} not found in your session vault.`;
     }
     if (secret.type !== 'stealth_pending') {
       return `❌ ${stealthId} is not a pending stealth transfer.`;
@@ -1571,6 +1633,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     console.log(`   Amount: ${secret.amount} HBAR`);
     console.log(`   Address: ${secret.stealthAddress}`);
 
+    // Use current session context for the claim
     const result = await this.claimStealthTransfer(secret.stealthAddress, secret.amount, secret.ephemeralPublicKey);
 
     // Only mark as claimed if successful
@@ -1583,7 +1646,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       console.error(`   ❌ Claim failed, marked for retry`);
     }
     secret.claimedAt = Date.now();
-    this.saveSecrets();
+    this.saveSessionSecrets();
 
     return result;
   }
@@ -1658,7 +1721,8 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     console.log(`\n🔍 Scanning for stuck stealth claims...\n`);
 
     const stuckClaims = [];
-    for (const [id, data] of this.userSecrets.entries()) {
+    const secrets = this.getSessionSecrets();
+    for (const [id, data] of secrets.entries()) {
       if (data.type === 'stealth_pending' && (data.status === 'PENDING_CLAIM' || data.status === 'CLAIM_FAILED')) {
         stuckClaims.push({
           id,
@@ -1697,10 +1761,11 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         if (availableHbar <= 0) {
           results += `❌ ${claim.id}: No funds in stealth address\n`;
           // Mark as invalid
-          const secret = this.userSecrets.get(claim.id);
+          const secretsMap = this.getSessionSecrets();
+          const secret = secretsMap.get(claim.id);
           if (secret) {
             secret.status = 'NO_FUNDS';
-            this.saveSecrets();
+            this.saveSessionSecrets();
           }
           continue;
         }
@@ -1714,19 +1779,21 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
         if (claimResult.includes('✅ Stealth Claim Complete')) {
           results += `✅ ${claim.id}: Successfully claimed ${claim.amount} HBAR\n`;
-          const secret = this.userSecrets.get(claim.id);
+          const secretsMap = this.getSessionSecrets();
+          const secret = secretsMap.get(claim.id);
           if (secret) {
             secret.status = 'CLAIMED';
             secret.claimedAt = Date.now();
-            this.saveSecrets();
+            this.saveSessionSecrets();
           }
         } else {
           results += `❌ ${claim.id}: ${claimResult.replace(/\n/g, ' ').slice(0, 80)}...\n`;
-          const secret = this.userSecrets.get(claim.id);
+          const secretsMap = this.getSessionSecrets();
+          const secret = secretsMap.get(claim.id);
           if (secret) {
             secret.status = 'CLAIM_FAILED';
             secret.claimError = claimResult;
-            this.saveSecrets();
+            this.saveSessionSecrets();
           }
         }
       } catch (error) {
@@ -1845,7 +1912,8 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
     // Store the received commitment in vault
     const transferId = `recv_${Date.now()}`;
-    this.userSecrets.set(transferId, {
+    const secrets = this.getSessionSecrets();
+    secrets.set(transferId, {
       secret: newSecret,
       nullifier: newNullifier,
       commitment: newCommitment,
@@ -1856,7 +1924,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       used: false
     });
 
-    this.saveSecrets();
+    this.saveSessionSecrets();
 
     console.log(`   💾 Stored in vault as: ${transferId}`);
     console.log(`   💰 New shielded balance: ${this.getShieldedBalance()} HBAR\n`);
@@ -1880,7 +1948,8 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    */
   getShieldedBalance() {
     let total = 0;
-    for (const [_, data] of this.userSecrets.entries()) {
+    const secrets = this.getSessionSecrets();
+    for (const [_, data] of secrets.entries()) {
       if (data.used !== true && data.amount) {
         total += data.amount;
       }
@@ -1933,11 +2002,34 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
   /**
    * Parse and execute direct commands (no AI needed)
+   * @param {string} input Natural language or CLI command
+   * @param {string} evmAddress User's MetaMask address
+   * @param {boolean} isSandbox If true, blocks financial execution tools (HOL HCS-10 security)
    */
-  async executeDirectCommand(input) {
+  async executeDirectCommand(input, evmAddress = null, isSandbox = false) {
     const parts = input.toLowerCase().trim().split(/\s+/);
     const command = parts[0];
     
+    // ─── 🛡️ SECURITY: TOOL STRIPPING ───────────────────────────────────────
+    if (isSandbox) {
+      const dangerousCommands = [
+        'shield', 'shield-smart', 'fragmentshield',
+        'withdraw', 'transfer', 'internal-transfer', 'internal-swap', 'swap',
+        'public-transfer', 'stealth', 'claim'
+      ];
+
+      // If AI mode intercepts a sandboxed intent to execute something dangerous:
+      if (['ai-shield'].includes(command)) {
+        return `🛡️ [HOL SECURITY] I am operating in Read-Only Concierge Mode. I have prepared a shielding plan for ${parts[1]} HBAR, but you must execute the 'shield' transaction directly from your local terminal or wallet.`;
+      }
+
+      if (dangerousCommands.includes(command)) {
+        console.warn(`⚠️ [HOL SECURITY] Blocked execution of dangerous tool: ${command}`);
+        return `🛡️ [HOL SECURITY] The '${command}' tool is disabled for public HCS-10 requests to protect vault secrets and prevent gas draining. I can only provide quotes and pool status. You must sign execution transactions locally.`;
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
     try {
       switch (command) {
         case 'status':
@@ -2005,7 +2097,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
           if (isNaN(tAmt) || tAmt <= 0) {
             return '❌ Invalid amount. Must be a positive number.';
           }
-          return await this.autoInternalSwap(tRec, tAmt);
+          return await this.autoInternalSwap(tRec, tAmt, evmAddress);
 
         case 'public-transfer':
           // Public HBAR transfer (creates on-chain link)
@@ -2041,9 +2133,9 @@ If a user asks to withdraw to a public account, proactively warn them about chai
             const sid = stealthArgs.length > 2 ? stealthArgs[2] : null;
 
             if (sid) {
-              return await this.generateStealthAddressPrivate(rec, amt, sid);
+              return await this.generateStealthAddressPrivate(rec, amt, sid, null, evmAddress);
             } else {
-              return await this.autoStealthPrivate(rec, amt);
+              return await this.autoStealthPrivate(rec, amt, evmAddress);
             }
           }
         
@@ -2054,43 +2146,46 @@ If a user asks to withdraw to a public account, proactively warn them about chai
           }
           const iRec = parts[1];
           const iAmt = parseFloat(parts[2]);
-          return await this.autoInternalSwap(iRec, iAmt);
+          return await this.autoInternalSwap(iRec, iAmt, evmAddress);
         
         case 'withdraw':
           if (parts.length < 3) {
-            return '❌ Invalid usage. Usage: withdraw <amount> <recipient> OR withdraw <secretId> <recipient> <amount>\n   Example: withdraw 10 0.0.123456';
+            return '❌ Invalid usage. Usage: withdraw <amount> <recipient>\n   Example: withdraw 10 0.0.123456\n   Also: withdraw 10 to 0.0.123456';
           }
           
           let wRecipient, wAmount, wSid;
           
+          // Strip optional literal "to" keyword: `withdraw 0.1 to 0.0.xxx` → `withdraw 0.1 0.0.xxx`
+          const filteredParts = [parts[0], ...parts.slice(1).filter(p => p !== 'to')];
+
           // Type-Intelligent Parsing
-          const arg1 = parts[1];
-          const arg2 = parts[2];
-          const arg1IsAmount = !isNaN(parseFloat(arg1)) && !arg1.includes('frag_') && !arg1.includes('0.0.');
+          const arg1 = filteredParts[1];
+          const arg2 = filteredParts[2];
+          const arg1IsAmount = arg1 && !isNaN(parseFloat(arg1)) && !arg1.includes('frag_') && !arg1.includes('0.0.');
           
-          if (arg1IsAmount && parts.length === 3) {
+          if (arg1IsAmount && filteredParts.length === 3) {
             // Pattern: withdraw <amount> <recipient>
             wAmount = parseFloat(arg1);
             wRecipient = arg2;
-          } else if (parts.length >= 4) {
+          } else if (filteredParts.length >= 4) {
             // Pattern: withdraw <secretId> <recipient> <amount>
             wSid = arg1;
             wRecipient = arg2;
-            wAmount = parseFloat(parts[3]);
+            wAmount = parseFloat(filteredParts[3]);
           } else {
             // Pattern: withdraw <recipient> <amount> (legacy/fallback)
             wRecipient = arg1;
             wAmount = parseFloat(arg2);
           }
           
-          return await this.withdrawFunds(wRecipient, wAmount, wSid);
+          return await this.withdrawFunds(wRecipient, wAmount, wSid, evmAddress);
         
         case 'shield':
           const amount = parseFloat(parts[1]);
           if (isNaN(amount) || amount <= 0) {
             return '❌ Invalid amount. Usage: shield <amount> (e.g., shield 100)';
           }
-          return await this.shieldFunds(amount);
+          return await this.aiShieldFunds(amount);
         
         case 'shield-smart':
         case 'fragmentshield':
@@ -2128,27 +2223,10 @@ If a user asks to withdraw to a public account, proactively warn them about chai
           }
           const question = parts.slice(2).join(' '); // Optional question
           return await this.consultAI(consultAmount, question);
-        
-        case 'balance':
-        case 'shields':
-          this.loadSecrets(); // Refresh from disk
-          return this.showShieldedBalance();
-          
-        case 'check-balance':
-          return await this.checkBalance(parts[1]);
-          
-        case 'transfer':
-          if (parts.length < 3) return "❌ Usage: transfer <to> <amount>";
-          return await this.transferHbar(parts[1], parseFloat(parts[2]));
-          
-        case 'internal-transfer':
-        case 'swap':
-          if (parts.length < 3) return "❌ Usage: internal-transfer <recipientAccount> <amount>";
-          return await this.autoInternalSwap(parts[1], parseFloat(parts[2]));
-          
+
         case 'help':
           return this.showHelp();
-        
+
         case 'login':
           if (parts.length < 3) {
             return '❌ Invalid usage. Usage: login <accountId> <privateKey>\n   Example: login 0.0.123456 302e020100300506032b657004220420...';
@@ -2156,6 +2234,8 @@ If a user asks to withdraw to a public account, proactively warn them about chai
           const newAccountId = parts[1];
           const newPrivateKey = parts[2];
           return await this.switchAccount(newAccountId, newPrivateKey);
+
+        default:
           return `❌ Unknown command: ${command}\nType 'help' for available commands.`;
       }
     } catch (error) {
@@ -2169,8 +2249,9 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   showShieldedBalance() {
     let total = 0;
     let fragments = [];
+    const secrets = this.getSessionSecrets();
     
-    for (const [id, data] of this.userSecrets.entries()) {
+    for (const [id, data] of secrets.entries()) {
       if (!data.used) {
         total += data.amount;
         fragments.push({ id, amount: data.amount, timestamp: data.timestamp });
@@ -2220,12 +2301,13 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    * List user's shielded funds (unspent fragments in pool)
    * Reads from live userSecrets Map (not cached blindedVault)
    */
-  listUserShieldedFunds() {
-    // Read from userSecrets Map (source of truth) not cached blindedVault
+   listUserShieldedFunds() {
+    // Read from the correct session's secrets Map
+    const secrets = this.getSessionSecrets();
     const unspent = [];
     const pendingStealth = [];
 
-    for (const [id, data] of this.userSecrets.entries()) {
+    for (const [id, data] of secrets.entries()) {
       if (data.type === 'stealth_pending') {
         pendingStealth.push({ id, ...data });
       } else if (!data.used && data.amount > 0) {
@@ -2294,7 +2376,8 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    */
   debugVault() {
     const entries = [];
-    for (const [id, data] of this.userSecrets.entries()) {
+    const secrets = this.getSessionSecrets();
+    for (const [id, data] of secrets.entries()) {
       entries.push({
         id,
         used: data.used === true,
@@ -2344,6 +2427,12 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       this.blindedVault = this.vault.getBlindedVault(data);
       this.logger.logic('🔐 Vault Decrypted & Blinded: AI Agent cannot see raw secrets.');
     } catch (e) {
+      if (e.message.includes('Vault Decryption Failed')) {
+        // This is perfectly normal in the new Multi-Tenant setup when the global .env agent 
+        // hasn't been provisioned with a password-protected vault, but a file exists.
+        console.log('ℹ️  Global vault is encrypted but no legacy AI password found. Waiting for session provisioning...');
+        return;
+      }
       console.error('⚠️ Vault error:', e.message);
       // Migration: If file exists but decrypt fails, might be plaintext
       if (fs.existsSync(this.secretsPath)) {
@@ -2376,12 +2465,13 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   /**
    * Auto-collects fragments to fulfill a private stealth payment
    */
-  async autoStealthPrivate(recipientAccountId, amount) {
+  async autoStealthPrivate(recipientAccountId, amount, evmAddress) {
     console.log(`🔒 AUTO Private Stealth: Pool -> ${recipientAccountId} (${amount} HBAR)\n`);
 
-    // Get unspent fragments from live userSecrets (source of truth)
+    // Get unspent fragments from the correct session's secrets
+    const secrets = this.getSessionSecrets(evmAddress);
     const unspent = [];
-    for (const [id, data] of this.userSecrets.entries()) {
+    for (const [id, data] of secrets.entries()) {
       if (data.used !== true && data.amount > 0 && !data.type) {
         unspent.push({ id, amount: data.amount });
       }
@@ -2426,21 +2516,31 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     }
 
     // --- Human-In-The-Loop Confirmation ---
-    const confirmed = await this.confirmWithdrawal(recipientAccountId, amount);
+    const confirmed = await this.confirmWithdrawal(recipientAccountId, amount, evmAddress);
     if (!confirmed) return `🛑 Private Stealth cancelled by user.`;
 
     // --- Generate ONE Stealth Address for all fragments ---
-    const recipientViewKey = process.env.RECEIVER_VIEW_KEY || "0x1cf9ff017f28eb6576a39f5cdd78c1560b37173ae7659a1f83770709c2ed5262";
-    const recipientSpendKey = process.env.RECEIVER_SPEND_KEY || "0xb3fbf0bf2e4ddbcdaf49973131719bc87fa0d8542e1b6cf17cca6f4aef43f330";
+    const keys = this.getSessionKeys();
+    const recipientViewKey = keys.viewKey;
+    const recipientSpendKey = keys.spendKey;
+    if (!recipientViewKey || !recipientSpendKey) {
+       return `❌ Cannot auto-stealth: Receiver keys not provisioned in active session.`;
+    }
+
     const hip1334 = require('../../lib/hip1334.cjs');
     
     // Generate ephemeral key pair for X25519
-    const keys = hip1334.generateX25519KeyPair();
-    const ephPub = keys.publicKeyHex;
-    const ephPriv = keys.privateKeyHex;
+    const ephKeys = hip1334.generateX25519KeyPair();
+    const ephPub = ephKeys.publicKeyHex;
+    const ephPriv = ephKeys.privateKeyHex;
     
     // Compute shared secret via X25519
-    const sharedSecretBuffer = hip1334.x25519SharedSecret(ephPriv, recipientViewKey.replace('0x', ''));
+    // IMPORTANT: x25519SharedSecret(privKey, pubKey) - sender uses:
+    //   own = ephemeralPrivKey, their = recipient's X25519 PUBLIC key (derived from viewPrivKey)
+    // Receiver claims using: x25519SharedSecret(viewPrivKey, ephPub)
+    // Both produce the same secret due to DH commutativity.
+    const recipientViewPublicKey = hip1334.x25519PublicKeyFromPrivate(recipientViewKey.replace('0x', ''));
+    const sharedSecretBuffer = hip1334.x25519SharedSecret(ephPriv, recipientViewPublicKey);
     const sharedSecretHex = sharedSecretBuffer.toString('hex');
     
     // Compute offset scalar from shared secret
@@ -2473,18 +2573,18 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         const frag = selectedSecrets[i];
         console.log(`\n⏳ Processing fragment ${i+1}/${selectedSecrets.length} (${frag.amount} HBAR)...`);
         
-        const sec = this.userSecrets.get(frag.id);
+        const sec = secrets.get(frag.id);
         if (!sec) continue;
 
         const stealthCreds = { targetAddress, ephPub };
-        const res = await this.generateStealthAddressPrivate(recipientAccountId, frag.amount, frag.id, stealthCreds);
+        const res = await this.generateStealthAddressPrivate(recipientAccountId, frag.amount, frag.id, stealthCreds, evmAddress);
         
         if (res.startsWith('❌')) {
             allSuccess = false;
             results += `   ❌ Fragment [${frag.id}]: failed\n`;
         } else {
             sec.used = true;
-            this.saveSecrets();
+            this.saveSessionSecrets(evmAddress);
             results += `   ✅ Fragment [${frag.id}]: Sent ${frag.amount} HBAR via Stealth\n`;
         }
     }
@@ -2549,30 +2649,45 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   /**
    * Human-In-The-Loop (HITL) Confirmation
    */
-  async confirmWithdrawal(recipient, amount) {
+  async confirmWithdrawal(recipient, amount, initiatorAddress = null) {
+    const confirmationId = `conf_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // 📢 Broadcast to Dashboard via SSE
+    vanishLogEmitter.emit('confirmation-required', {
+      id: confirmationId,
+      type: 'transfer',
+      recipient: recipient,
+      amount: amount,
+      initiatorAddress: initiatorAddress, // CRITICAL: Isolates modal to correct tab
+      timestamp: new Date().toISOString(),
+      message: `🖐️ SECURITY CHECKPOINT: Awaiting authorization for ${amount} HBAR transfer to ${recipient}`
+    });
+
     console.log(`\n` + `━`.repeat(40));
-    console.log(`🖐️  SECURITY CHECK: HUMAN-IN-THE-LOOP REQUIRED`);
+    console.log(`🖐️  SECURITY CHECKPOINT: Awaiting UI Authorization [ID: ${confirmationId}]`);
     console.log(`   Action: Send HBAR from Vanish Privacy Pool`);
     console.log(`   Recipient: ${recipient}`);
     console.log(`   Amount: ${amount} HBAR`);
     console.log(`━`.repeat(40));
-    
+
     return new Promise((resolve) => {
-      if (this.rl) {
-        this.rl.question(`⚠️  Type 'confirm' to unlock vault & sign transaction: `, (answer) => {
-          resolve(answer.trim().toLowerCase() === 'confirm');
-        });
-      } else {
-        const rl = readline.createInterface({
-          input: process.stdin,
-          output: process.stdout
-        });
-        
-        rl.question(`⚠️  Type 'confirm' to unlock vault & sign transaction: `, (answer) => {
-          rl.close();
-          resolve(answer.trim().toLowerCase() === 'confirm');
-        });
-      }
+      // Store the resolver in our pending map
+      this.pendingConfirmations.set(confirmationId, { 
+        resolve, 
+        recipient, 
+        amount,
+        type: 'transfer',
+        timestamp: Date.now() 
+      });
+
+      // Auto-expire after 5 minutes
+      setTimeout(() => {
+        if (this.pendingConfirmations.has(confirmationId)) {
+          console.log(`⏰ Confirmation ${confirmationId} expired.`);
+          this.pendingConfirmations.get(confirmationId).resolve(false);
+          this.pendingConfirmations.delete(confirmationId);
+        }
+      }, 5 * 60 * 1000);
     });
   }
 
@@ -2611,11 +2726,12 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   /**
    * PRIVATE Stealth Address: Send from Pool -> Stealth
    */
-  async generateStealthAddressPrivate(recipientAccountId, amount, secretId, preGeneratedStealth = null) {
+  async generateStealthAddressPrivate(recipientAccountId, amount, secretId, preGeneratedStealth = null, evmAddress = null) {
     console.log(`🔒 PRIVATE Stealth Payment: Pool -> ${recipientAccountId} (${amount} HBAR)\n`);
     
-    const secret = this.userSecrets.get(secretId);
-    if (!secret) return `❌ Secret ID ${secretId} not found in local vault.`;
+    const secrets = this.getSessionSecrets(evmAddress);
+    const secret = secrets.get(secretId);
+    if (!secret) return `❌ Secret ID ${secretId} not found in session vault.`;
 
     const actualSecret = typeof secret === 'object' ? secret.secret : secret;
     const actualNullifier = (typeof secret === 'object' && secret.nullifier) ? secret.nullifier : '0x' + crypto.randomBytes(32).toString('hex');
@@ -2628,8 +2744,12 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       ephPub = preGeneratedStealth.ephPub;
     } else {
       // 1. Generate Stealth Address for Recipient using secp256k1 homomorphic derivation
-      const recipientViewKey = process.env.RECEIVER_VIEW_KEY || "0x1cf9ff017f28eb6576a39f5cdd78c1560b37173ae7659a1f83770709c2ed5262";
-      const recipientSpendKey = process.env.RECEIVER_SPEND_KEY || "0xb3fbf0bf2e4ddbcdaf49973131719bc87fa0d8542e1b6cf17cca6f4aef43f330";
+      const sessionKeys = this.getSessionKeys();
+      const recipientViewKey = sessionKeys.viewKey;
+      const recipientSpendKey = sessionKeys.spendKey;
+      if (!recipientViewKey || !recipientSpendKey) {
+         return `❌ Cannot auto-stealth: Receiver keys not provisioned in active session.`;
+      }
 
       // Generate ephemeral key pair for X25519
       const keys = hip1334.generateX25519KeyPair();
@@ -2637,7 +2757,9 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       const ephPriv = keys.privateKeyHex;
       
       // Compute shared secret via X25519
-      const sharedSecretBuffer = hip1334.x25519SharedSecret(ephPriv, recipientViewKey.replace('0x', ''));
+      // IMPORTANT: sender uses recipient's X25519 PUBLIC key (not the stored private key)
+      const recipientViewPublicKey = hip1334.x25519PublicKeyFromPrivate(recipientViewKey.replace('0x', ''));
+      const sharedSecretBuffer = hip1334.x25519SharedSecret(ephPriv, recipientViewPublicKey);
       const sharedSecretHex = sharedSecretBuffer.toString('hex');
       
       // Compute offset scalar from shared secret
@@ -2729,12 +2851,13 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   /**
    * Auto-collects fragments for an INTERNAL shielded swap (Commitment to Commitment)
    */
-  async autoInternalSwap(recipientAccountId, amount) {
+  async autoInternalSwap(recipientAccountId, amount, evmAddress) {
     console.log(`🔒 AUTO Internal Swap: Pool -> Pool (Recipient: ${recipientAccountId}, ${amount} HBAR)\n`);
 
-    // 1. Find exact fragments (using live userSecrets Map, not cached blindedVault)
+    // 1. Find exact fragments (using the correct session's secrets)
+    const secrets = this.getSessionSecrets(evmAddress);
     const unspent = [];
-    for (const [id, data] of this.userSecrets.entries()) {
+    for (const [id, data] of secrets.entries()) {
       if (data.used !== true && data.amount > 0 && !data.type) {
         unspent.push({ id, amount: data.amount });
       }
@@ -2751,7 +2874,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     }
 
     // --- Human-In-The-Loop Confirmation ---
-    const confirmed = await this.confirmWithdrawal(recipientAccountId, amount);
+    const confirmed = await this.confirmWithdrawal(recipientAccountId, amount, evmAddress);
     if (!confirmed) return `🛑 Internal Swap cancelled by user.`;
 
     console.log(`🧩 Selected ${selectedSecrets.length} fragments for internal swap.`);
@@ -2766,18 +2889,19 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       const newCommitment = '0x' + crypto.randomBytes(32).toString('hex'); // Mocked Poseidon for internal swap leaf
 
       // Generate proof with recipient 0x0...0
-      const res = await this.generateInternalSwapPayload(recipientAccountId, frag.amount, frag.id, newCommitment, { newSecret, newNullifier });
+      const res = await this.generateInternalSwapPayload(recipientAccountId, frag.amount, frag.id, newCommitment, { newSecret, newNullifier }, evmAddress);
       
       if (res.startsWith('❌')) {
         results += `   ❌ Fragment [${frag.id}]: failed\n`;
       } else {
-        const sec = this.userSecrets.get(frag.id);
+        const secretsMap = this.getSessionSecrets(evmAddress);
+        const sec = secretsMap.get(frag.id);
         if (sec) {
           sec.used = true;
-          this.saveSecrets();
-          console.log(`   🔒 Marked ${frag.id} as used in vault`);
+          this.saveSessionSecrets(evmAddress);
+          console.log(`   🔒 Marked ${frag.id} as used in session vault`);
         } else {
-          console.warn(`   ⚠️ Could not mark ${frag.id} as used - not found in vault`);
+          console.warn(`   ⚠️ Could not mark ${frag.id} as used - not found in session vault`);
         }
         results += `   ✅ Fragment [${frag.id}]: Swapped ${frag.amount} HBAR internally\n`;
       }
@@ -2786,12 +2910,19 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     return results;
   }
 
-  async generateInternalSwapPayload(recipientAccountId, amount, secretId, newCommitment, recipientKeys) {
-    const secret = this.userSecrets.get(secretId);
+  async generateInternalSwapPayload(recipientAccountId, amount, secretId, newCommitment, recipientKeys, evmAddress = null) {
+    const secrets = this.getSessionSecrets(evmAddress);
+    const secret = secrets.get(secretId);
     const zeroAddr = '0x' + '0'.repeat(40);
     
+    this.logger.thought(`🔄 Preparing ZK-ritual for ${amount} HBAR transfer to ${recipientAccountId}`);
+    this.logger.logic(`🔍 Selected unspent fragment [${secretId.substring(0, 12)}...] as source liquidity.`);
+    
     // 1. Generate ZK proof with recipient = 0
+    this.logger.thought(`⚙️ Calculating Merkle paths and witness for ${this.accountId}...`);
     const testData = await generateTestInputs({ secret: secret.secret, nullifier: secret.nullifier, amount });
+    
+    this.logger.thought(`🛡️ Executing snarkjs-powered ZK-circuit (Witness generation & Proof synthesis)...`);
     const withdrawTool = tools.find(t => t.name === 'generate_withdraw_proof');
     const proofResult = await withdrawTool.func({
       secret: secret.secret,
@@ -2804,9 +2935,15 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     });
 
     const proofData = JSON.parse(proofResult);
-    if (!proofData.success) return `❌ Proof failed: ${proofData.error}`;
+    if (!proofData.success) {
+      this.logger.logic(`❌ ZK Proof Synthesis failed: ${proofData.error}`);
+      return `❌ Proof failed: ${proofData.error}`;
+    }
+
+    this.logger.logic(`✅ ZK Proof synthesized successfully. Commitment: ${newCommitment.substring(0, 16)}...`);
 
     // 2. Submit to Pool Manager with newCommitment
+    this.logger.decision(`🚀 Broadcasting ZK-Proof & Stealth Payload via HIP-1334 (Target: ${recipientAccountId})`);
     const submitTool = tools.find(t => t.name === 'submit_proof_to_pool');
     const submitResult = await submitTool.func({
       proof: proofData.proof,
@@ -2825,6 +2962,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       }
     });
 
+    this.logger.logic(`📬 Submission complete. Check Pool Manager logs for batch inclusion.`);
     return submitResult;
   }
 
@@ -2860,9 +2998,42 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     return output;
   }
 
-  async withdrawFunds(recipient, amount, secretId = null) {
-    console.log(`\n🛡️  Vanish Privacy Advisory: 'Exit Point' Security Check\n`);
-    
+  /**
+   * Helper to resolve a native Hedera Account ID to its EVM address using the Mirror Node.
+   * This is critical to prevent `CONTRACT_REVERT_EXECUTED` when the VanishGuard contract
+   * attempts to use `.call{value: ...}` to send funds to an uninitialized long-zero address.
+   */
+  async resolveToEvmAddress(accountId) {
+    if (!accountId || accountId.toLowerCase().startsWith('0x')) return accountId;
+    try {
+      const axios = require('axios');
+      const url = `${process.env.MIRROR_NODE_URL || 'https://testnet.mirrornode.hedera.com'}/api/v1/accounts/${accountId}`;
+      const response = await axios.get(url, { timeout: 3000 });
+      if (response.data && response.data.evm_address) {
+        return response.data.evm_address;
+      }
+    } catch (err) {
+      console.warn(`⚠️ Warning: Could not resolve EVM alias for ${accountId}. Fallback to native format.`);
+    }
+    return accountId;
+  }
+
+  /**
+   * Withdraw funds from the pool to a recipient's public account
+   */
+  async withdrawFunds(recipientAccountIdRaw, amount = null, secretId = null, evmAddress = null) {
+    // 🛡️ Resolve Native ID to EVM Alias to ensure EVM native execution succeeds without reverting!
+    const recipientAccountId = await this.resolveToEvmAddress(recipientAccountIdRaw);
+
+    if (recipientAccountId !== recipientAccountIdRaw) {
+      console.log(`🔍 [EVM Resolver] Auto-mapped native ID ${recipientAccountIdRaw} → ${recipientAccountId}`);
+    }
+
+    this.logger.logic(`Initiating withdrawal request for ${amount || 'all available'} HBAR...`, {
+      recipient: recipientAccountId,
+      secretId: secretId || 'auto-select'
+    });
+
     // 1. Amount Scrubbing check
     const isRoundAmount = (amount % 1 === 0) || (amount % 5 === 0);
     if (!isRoundAmount) {
@@ -2870,7 +3041,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       console.log(`💡 Privacy Tip: Withdrawing 'round' amounts (e.g., ${Math.floor(amount)} HBAR) breaks the 'Amount Fingerprint' used by chain analysis.`);
     }
 
-    console.log(`⚠️  'Exit Point' Alert: Withdrawing to a main account (${recipient}) creates an on-chain link.`);
+    console.log(`⚠️  'Exit Point' Alert: Withdrawing to a main account (${recipientAccountId}) creates an on-chain link.`);
     console.log(`💡 Safer Alternative: Stay inside the pool. Use 'internal-transfer' for peer-to-peer privacy.\n`);
     console.log(`✅ HIP-1340 Protection: The Pool Manager will pay the gas for this withdrawal to decouple your wallets.\n`);
 
@@ -2886,7 +3057,8 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     } else {
       console.log(`🔍 Searching live vault for matching HBAR fragments (Aggregation Mode)...`);
       const available = [];
-      for (const [id, data] of this.userSecrets.entries()) {
+      const secrets = this.getSessionSecrets(evmAddress);
+      for (const [id, data] of secrets.entries()) {
         if (data.used !== true && !this.isSecretPending(id) && data.amount > 0 && !data.type) {
           available.push({ id, amount: data.amount });
         }
@@ -2899,24 +3071,25 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       } else {
         // No exact match - show helpful message
         const totalAvailable = available.reduce((sum, a) => sum + a.amount, 0);
-        return `❌ No exact combination of fragments found for ${amount} HBAR.\n\n   Available fragments:\n${available.slice(0, 10).map(a => `      • ${a.id}: ${a.amount} HBAR`).join('\n')}\n\n   Total available: ${totalAvailable} HBAR\n\n   💡 Options:\n   1. Use a different amount that matches your fragments\n   2. Use 'shield-smart' to create smaller fragments\n   3. Specify exact fragment ID: withdraw <fragmentId> ${recipient} <amount>`;
+        return `❌ No exact combination of fragments found for ${amount} HBAR.\n\n   Available fragments:\n${available.slice(0, 10).map(a => `      • ${a.id}: ${a.amount} HBAR`).join('\n')}\n\n   Total available: ${totalAvailable} HBAR\n\n   💡 Options:\n   1. Use a different amount that matches your fragments\n   2. Use 'shield-smart' to create smaller fragments\n   3. Specify exact fragment ID: withdraw <fragmentId> ${recipientAccountId} <amount>`;
       }
     }
 
     // 3. Human-In-The-Loop Confirmation (HITL)
-    const confirmed = await this.confirmWithdrawal(recipient, amount);
+    const confirmed = await this.confirmWithdrawal(recipientAccountId, amount);
     if (!confirmed) return `🛑 Withdrawal cancelled by user.`;
 
     let totalSuccess = 0;
     for (const sid of selectedSecretIds) {
-      const fragData = this.userSecrets.get(sid);
+      const secrets = this.getSessionSecrets(evmAddress);
+      const fragData = secrets.get(sid);
       if (!fragData) {
         console.error(`❌ Fragment ${sid} not found in vault.`);
         continue;
       }
-      console.log(`🛡️  Withdrawing fragment ${sid} (${fragData.amount} HBAR) to ${recipient}...\n`);
+      console.log(`🛡️  Withdrawing fragment ${sid} (${fragData.amount} HBAR) to ${recipientAccountId}...\n`);
       
-      const secret = this.userSecrets.get(sid);
+      const secret = secrets.get(sid);
       if (!secret) {
         console.error(`❌ Secret ${sid} missing from full vault.`);
         continue;
@@ -2942,14 +3115,14 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         secret: actualSecret,
         nullifier: actualNullifier,
         amount: fragAmount,
-        recipient: recipient,
+        recipient: recipientAccountId,
         merkleRoot: testData.merkleRoot, // Must match testData path for demo
         merklePathElements: testData.merklePathElements,
         merklePathIndices: testData.merklePathIndices
       });
 
       this.logger.logic(`Generating withdrawal proof for ${fragAmount} HBAR...`, {
-        recipient,
+        recipient: recipientAccountId,
         merkleRoot: statusData.currentMerkleRoot || statusData.merkleRoot,
         inputs: this.logger.redact(testData)
       });
@@ -2976,7 +3149,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
             secretId: sid,
             submissionId: finalData.submissionId || crypto.randomBytes(16).toString('hex'),
             amount: fragAmount,
-            recipient: recipient,
+            recipient: recipientAccountId,
             submittedAt: Date.now(),
             status: 'PENDING'
           });
@@ -2988,7 +3161,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
     if (totalSuccess === selectedSecretIds.length && totalSuccess > 0) {
       return `✅ ALL Withdraw Proofs Submitted (${totalSuccess}/${selectedSecretIds.length})!
-   Recipient: ${recipient}
+   Recipient: ${recipientAccountId}
    Total:      ${amount} HBAR
    Status:     Pending Batch Processing
    
@@ -3001,7 +3174,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   /**
    * Shield funds (deposit into privacy pool)
    */
-  async shieldFunds(amount) {
+  async shieldFunds(amount, evmAddress = null) {
     console.log(`🛡️  Shielding ${amount} HBAR...\n`);
     
     // Generate user secret and nullifier
@@ -3031,8 +3204,9 @@ If a user asks to withdraw to a public account, proactively warn them about chai
     if (data.success) {
       // Store secret for withdrawal
       const secretId = crypto.randomBytes(8).toString('hex');
-      this.userSecrets.set(secretId, { secret, nullifier, amount, used: false });
-      this.saveSecrets();
+      const secrets = this.getSessionSecrets(evmAddress);
+      secrets.set(secretId, { secret, nullifier, amount, used: false });
+      this.saveSessionSecrets(evmAddress);
       
       console.log(`   📤 Submitting to Pool Manager...`);
       const submitResult = await this.submitProofToPoolManager({
@@ -3077,7 +3251,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    * Shield funds with smart fragmentation (RECOMMENDED)
    * Automatically calculates optimal fragments based on amount
    */
-  async shieldFundsFragmented(amount) {
+  async shieldFundsFragmented(amount, evmAddress = null) {
     console.log(`🎯 Smart Shield: ${amount} HBAR (with fragmentation)\n`);
 
     // Create fragmentation plan
@@ -3138,14 +3312,15 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         
         if (data.success) {
           // Store secret with amounts and flag
-          this.userSecrets.set(secretData.secretId, { 
+          const secretsMap = this.getSessionSecrets(evmAddress);
+          secretsMap.set(secretData.secretId, { 
              secret: secretData.secret, 
              nullifier: secretData.nullifier, 
              amount: fragmentAmount,
              used: false,
              timestamp: Date.now()
           });
-          this.saveSecrets(); // This now correctly updates blindedVault
+          this.saveSessionSecrets(evmAddress); // This now correctly updates blindedVault
           
           // Submit proof to Pool Manager
           console.log(`       📤 Submitting to Pool Manager...`);
@@ -3238,10 +3413,11 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   }
   
   /**
-   * AI-Powered Shield (Agent THINKS!)
-   * Uses Ollama AI to reason about optimal fragmentation strategy
+   * AI-Powered Smart Shield
+   * Uses Ollama to reason about the best fragmentation strategy
    */
-  async aiShieldFunds(amount) {
+  async aiShieldFunds(amount, evmAddress = null) {
+    this.logger.logic(`AI-Powered Smart Shield: ${amount} HBAR`, { amount });
     console.log(`\n🧠 AI-Powered Smart Shield: ${amount} HBAR\n`);
     console.log('💭 Agent is thinking about optimal strategy...\n');
     console.log('━'.repeat(60) + '\n');
@@ -3334,7 +3510,8 @@ If a user asks to withdraw to a public account, proactively warn them about chai
           const data = JSON.parse(result);
           if (data.success) {
             const secretId = `frag_${Date.now()}_${i}`;
-            this.userSecrets.set(secretId, {
+            const secretsMap = this.getSessionSecrets(evmAddress);
+            secretsMap.set(secretId, {
               secret: secrets[i].secret,
               nullifier: secrets[i].nullifier,
               amount: plan.fragmentAmounts[i],
@@ -3342,7 +3519,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
               timestamp: Date.now(),
               used: false
             });
-            this.saveSecrets(); // SAVE TO ENCRYPTED VAULT
+            this.saveSessionSecrets(evmAddress); // SAVE TO ENCRYPTED VAULT
             
             // Submit proof to Pool Manager
             console.log(`       📤 Submitting to Pool Manager...`);
@@ -3743,10 +3920,15 @@ Be concise, technical, and privacy-focused in your responses.`;
   
   /**
    * Process user command (AI mode or direct mode)
+   * @param {string} userInput - The command to process
+   * @param {string} evmAddress - Optional EVM address for session context (from HTTP requests)
    */
-  async processCommand(userInput) {
+  async processCommand(userInput, evmAddress = null) {
     const parts = userInput.trim().split(/\s+/);
     const command = parts[0].toLowerCase();
+
+    // For CLI mode, use activeSessionAddress if no evmAddress provided
+    const sessionAddress = evmAddress || this.activeSessionAddress;
 
     // HYBRID MODE: Check if this is a direct protocol command even in AI mode
     // This prevents the AI from entering infinite loops for standard operations.
@@ -3759,14 +3941,14 @@ Be concise, technical, and privacy-focused in your responses.`;
 
     if (directCommands.includes(command)) {
       console.log(`🔹 [LOGIC] Bypassing LLM loop for direct protocol command: ${command}`);
-      return await this.executeDirectCommand(userInput);
+      return await this.executeDirectCommand(userInput, sessionAddress);
     }
 
     // Otherwise, use AI for natural language conversation
     if (this.aiMode) {
       return await this.processWithAI(userInput);
     } else {
-      return await this.executeDirectCommand(userInput);
+      return await this.executeDirectCommand(userInput, sessionAddress);
     }
   }
   
