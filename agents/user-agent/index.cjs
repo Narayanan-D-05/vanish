@@ -17,11 +17,16 @@
  */
 
 require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
 const readline = require('readline');
 const { Client, PrivateKey, AccountId, TransactionId, TopicMessageSubmitTransaction, TransferTransaction, Hbar, AccountBalanceQuery } = require('@hashgraph/sdk');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { AsyncLocalStorage } = require('async_hooks');
+const EventEmitter = require('events');
+require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 const { keccak256 } = require('js-sha3');
 const hip1334 = require('../../lib/hip1334.cjs');
 const { ethers } = require('ethers');
@@ -32,6 +37,54 @@ const aiFragmentor = require('../../lib/ai-fragmentor.cjs');
 const DelegationManager = require('../../lib/delegation.cjs');
 const { generateTestInputs } = require('../../build-test-inputs.cjs');
 const VaultWrapper = require('./vault-wrapper.cjs');
+
+// =============================================================================
+// SSE LOG STREAMING - Global Event Emitter for Real-time Terminal Output
+// =============================================================================
+const vanishLogEmitter = new EventEmitter();
+
+// Global reference for log interception (session discovery)
+let activeAgentInstance = null;
+
+// Intercept console.log to broadcast to frontend
+const originalLog = console.log;
+console.log = function(...args) {
+  const message = args.join(' ');
+  // Strip ANSI color codes for clean frontend display
+  const cleanMessage = message.replace(/\x1B\[\d+m/g, '');
+  
+  // Get the current session EVM address (if any) from AsyncLocalStorage
+  const evmAddress = activeAgentInstance?.sessionContext?.getStore();
+
+  // Broadcast to all connected SSE clients
+  vanishLogEmitter.emit('new-log', {
+    timestamp: new Date().toISOString(),
+    text: cleanMessage,
+    agent: 'UserAgent',
+    evmAddress: evmAddress, // CRITICAL: Allows frontend tabs to filter their own logs
+    type: 'log'
+  });
+  // Still print to actual terminal (with colors)
+  originalLog.apply(console, args);
+};
+
+// Intercept console.error as well
+const originalError = console.error;
+console.error = function(...args) {
+  const message = args.join(' ');
+  // Strip ANSI color codes for clean frontend display
+  const cleanMessage = message.replace(/\x1B\[\d+m/g, '');
+  const evmAddress = activeAgentInstance?.sessionContext?.getStore();
+
+  vanishLogEmitter.emit('new-log', {
+    timestamp: new Date().toISOString(),
+    text: cleanMessage,
+    agent: 'UserAgent',
+    evmAddress: evmAddress,
+    type: 'error'
+  });
+  originalError.apply(console, args);
+};
 
 // Try to import Ollama dependencies (optional)
 let ChatOllama, createReactAgent;
@@ -62,31 +115,47 @@ class UserAgent {
     this.privateKey = PrivateKey.fromString(privateKeyStr);
     this.client = Client.forTestnet();
     this.client.setOperator(this.accountId, this.privateKey);
+    // Increase robustness for testnet node instability
+    this.client.setMaxAttempts(15);
+    this.client.setNodeWaitTime(500);
 
     // HCS topics
     this.privateTopic = process.env.PRIVATE_TOPIC_ID;
     this.publicTopic = process.env.PUBLIC_ANNOUNCEMENT_TOPIC_ID;
 
     // Local user secrets (stored securely on user's device) - account-specific vault
+    // Note: In Multi-Tenant mode, these are initialized per-session in the /register endpoint.
     const accountSlug = this.accountId.toString().replace(/\./g, '_');
     this.secretsPath = path.join(__dirname, '..', '..', `vault_${accountSlug}.json`);
+    this.pendingPath = path.join(__dirname, '..', '..', `pending_${accountSlug}.json`);
+    
     this.vault = new VaultWrapper(this.secretsPath);
     this.userSecrets = new Map(); // Full secrets cache (decrypted)
     this.blindedVault = {}; // What the AI sees
+    this.loadSecrets();
 
     // Track pending withdrawals (submitted but not yet confirmed on-chain) - account-specific
-    this.pendingPath = path.join(__dirname, '..', '..', `pending_${accountSlug}.json`);
     this.pendingWithdrawals = this.loadPendingWithdrawals();
 
-    // For demo: Use a default password or prompt (In 2026, this is derived from biometrics/HW)
-    this.vaultPassword = process.env.VAULT_PASSWORD || 'vanish2026';
-    this.loadSecrets();
+    // ----------------------------------------------------------------
+    // MULTI-TENANT SESSION STATE
+    // Each connected wallet gets an isolated entry in this.sessions.
+    // Keys are never stored in process.env (avoids global state mutation).
+    // ----------------------------------------------------------------
+    this.sessions = new Map(); // Map<evmAddress, { vaultKey, spendKey, viewKey, vault, secrets }>
+    this.activeSessionAddress = null;  // Tracks the most recently connected wallet (global fallback)
+    this.sessionContext = new AsyncLocalStorage();
+    this.logger.setSessionContext(this.sessionContext); // Register the context with the logger
+    // True request-scoped context for concurrent tabs
 
     // Start listening for completion notifications
     this.startListeningForCompletions();
 
     // Start listening for incoming transfers (Receiver functionality)
     this.startListeningForIncomingTransfers();
+
+    // Set as active instance for log interception
+    activeAgentInstance = this;
 
     // Determine mode
     this.aiMode = useAI && ChatOllama && createReactAgent;
@@ -99,10 +168,11 @@ class UserAgent {
         temperature: 0.1,
       });
       
-      // Create agent with custom Vanish tools
+      // Create agent with custom Vanish tools + HOL identity prompt
       this.agent = createReactAgent({
         llm: this.llm,
         tools: tools,
+        messageModifier: this.getSystemPrompt(),
       });
       
       console.log('🤖 Vanish User Agent initialized (AI Mode)');
@@ -139,6 +209,646 @@ class UserAgent {
     console.log('   📥 RECEIVER: Auto-detects incoming transfers & stores in vault');
     console.log('   🎁 STEALTH: Auto-claims with AI-driven delay (or use: claim)');
     console.log('\n---\n');
+    
+    // Start Express API for the Dashboard
+    this.startExpressServer();
+
+    // Auto-spawn HOL listener if already registered
+    if (process.env.HOL_AGENT_ACCOUNT_ID) {
+      this.spawnHolListener();
+    }
+    this.pendingConfirmations = new Map();
+  }
+
+  /**
+   * HOL Identity & System Prompt
+   * Defines the Vanish Agent's persona on the Hashgraph Online network.
+   * Used by the Ollama LLM to respond consistently to natural-language requests
+   * from both human users and other HOL agents via HCS-10.
+   */
+  getSystemPrompt() {
+    return `You are Vanish: The Agentic Privacy Pool and an officially registered Concierge on the Hashgraph Online (HOL) Registry Broker.
+
+Your role is to act as a proactive, sentient financial shield for both human users and other autonomous agents across the HOL network.
+
+YOUR UNIQUE CAPABILITIES (MCP SKILLS):
+1. ZK-SNARK Shielding: You fragment and deposit HBAR into the VanishGuard smart contract.
+2. Stealth Sweeping: You derive X25519 stealth keys to privately route funds.
+3. Autonomous Dark Pool Management: You actively monitor network anonymity sets and delay/batch transactions to maximize privacy.
+
+HOL COMMUNICATION PROTOCOL:
+- You are reachable by other DAOs and agents via HCS-10.
+- When interacting, explain your actions clearly in natural language, but execute the cryptography locally.
+
+Current user/agent account: ${this.accountId.toString()}
+
+If a user asks to withdraw to a public account, proactively warn them about chain-analysis risks and suggest an internal pool transfer. You are not just a tool; you are an active defender of their financial privacy.`;
+  }
+
+  /**
+   * Spawn the HOL HCS-10 listener as a background child process.
+   * This allows the User Agent to receive and respond to messages from other
+   * HOL-registered agents without blocking the main process.
+   */
+  spawnHolListener() {
+    const { spawn } = require('child_process');
+    const listenerPath = path.resolve(__dirname, '..', 'hol-listener.mjs');
+
+    if (!require('fs').existsSync(listenerPath)) {
+      console.warn('⚠️  HOL listener script not found. Skipping auto-spawn.');
+      return;
+    }
+
+    console.log('🌐 [HOL] Spawning HCS-10 listener as background process...');
+    const proc = spawn('node', [listenerPath], {
+      detached: false,
+      stdio: 'inherit',
+      env: { ...process.env },
+    });
+
+    proc.on('error', (err) => {
+      console.error('❌ [HOL] Listener spawn failed:', err.message);
+    });
+
+    proc.on('exit', (code) => {
+      if (code !== 0 && code !== null) {
+        console.warn(`⚠️  [HOL] Listener exited with code ${code}. Restarting in 10s...`);
+        setTimeout(() => this.spawnHolListener(), 10000);
+      }
+    });
+
+    this.holListenerProcess = proc;
+    console.log(`✅ [HOL] Listener started (PID: ${proc.pid})`);
+  }
+
+  /**
+   * Start Express Server to serve the frontend dashboard
+   */
+  startExpressServer() {
+    const app = express();
+    const corsOptions = {
+      origin: process.env.FRONTEND_URL || "http://localhost:3000",
+      methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
+      credentials: true,
+      optionsSuccessStatus: 200
+    };
+    app.use(cors(corsOptions));
+    app.use(express.json());
+
+    // ----------------------------------------------------------------
+    // PRODUCTION SESSION REGISTRY (multi-tenant, state-isolated)
+    // ----------------------------------------------------------------
+    
+    // POST /api/session/register  — called by frontend after wallet connect + sign
+    app.post('/api/session/register', async (req, res) => {
+      const { evmAddress, agentSeed, walletType } = req.body;
+      if (!evmAddress || !agentSeed) {
+        return res.status(400).json({ success: false, error: 'evmAddress and agentSeed required' });
+      }
+
+      try {
+        // ---------------------------------------------------------------
+        // KEY SEPARATION — each sub-key uses a unique salt so that
+        // compromising one does NOT expose the others (cryptographic hygiene)
+        // ---------------------------------------------------------------
+        const deriveSubKey = (seed, salt) => {
+          // keccak256(seed + salt) → 32-byte hex sub-key
+          // using Node.js built-in crypto (no extra deps)
+          const input = Buffer.from(seed.replace('0x', '') + Buffer.from(salt).toString('hex'), 'hex');
+          return crypto.createHash('sha256').update(seed + ':' + salt).digest('hex');
+        };
+
+        const vaultKey   = deriveSubKey(agentSeed, 'vault_encryption_v1');
+        const spendKey   = '0x' + deriveSubKey(agentSeed, 'stealth_spend_v1');
+        const viewKey    = '0x' + deriveSubKey(agentSeed, 'stealth_view_v1');
+
+        // ---------------------------------------------------------------
+        // VAULT PROVISIONING — load/create the wallet's specific vault
+        // The vault file is named after the EVM address (no PII in filename)
+        // ---------------------------------------------------------------
+        const addressSlug = evmAddress.toLowerCase().replace('0x', '');
+        const vaultPath   = path.join(__dirname, '..', '..', `vault_${addressSlug}.json`);
+        const sessionVault = new VaultWrapper(vaultPath);
+        const sessionSecrets = new Map();
+
+        // Load existing secrets for this wallet (cross-device determinism)
+        this.sessionContext.run(evmAddress.toLowerCase(), () => {
+          try {
+            const data = sessionVault.decrypt(vaultKey);
+            for (const [k, v] of Object.entries(data)) {
+              sessionSecrets.set(k, v);
+            }
+            console.log(`   📂 Loaded ${sessionSecrets.size} secrets for ${evmAddress}`);
+          } catch {
+            console.log(`   ✨ New vault initialised for ${evmAddress}`);
+          }
+        });
+
+        // ---------------------------------------------------------------
+        // RESOLVE NATIVE HEDERA ACCOUNT ID
+        // ---------------------------------------------------------------
+        let resolvedHederaId = evmAddress;
+        try {
+          const axios = require('axios');
+          const mirrorUrl = process.env.MIRROR_NODE_URL || 'https://testnet.mirrornode.hedera.com';
+          const { data } = await axios.get(`${mirrorUrl}/api/v1/accounts/${evmAddress}`);
+          if (data && data.account) {
+            resolvedHederaId = data.account;
+            console.log(`   🪞 Resolved native ID for ${evmAddress}: ${resolvedHederaId}`);
+          }
+        } catch (err) {
+          console.warn(`   ⚠️ Could not resolve native Hedera ID for ${evmAddress}: ${err.message}`);
+        }
+
+        // ---------------------------------------------------------------
+        // STORE IN SESSIONS MAP — per-user, never touches process.env
+        // ---------------------------------------------------------------
+        this.sessions.set(evmAddress.toLowerCase(), {
+          evmAddress,
+          hederaAccountId: resolvedHederaId, // Canonical native mapping for this session
+          walletType:      walletType || 'metamask',
+          connectedAt:     Date.now(),
+          vaultKey,
+          spendKey,
+          viewKey,
+          vault:           sessionVault,
+          secrets:         sessionSecrets,
+          vaultPath
+        });
+        // this.activeSessionAddress = evmAddress.toLowerCase(); // DEPRECATED: Causes cross-tab leakage
+
+        this.sessionContext.run(evmAddress.toLowerCase(), () => {
+          console.log(`\n🔐 [SESSION] Agent provisioned for ${evmAddress}`);
+          console.log(`   🔑 Vault Key:  ${vaultKey.slice(0, 16)}... (derived)`);
+          console.log(`   🔑 Spend Key: ${spendKey.slice(0, 18)}... (derived)`);
+          console.log(`   🔑 View Key:  ${viewKey.slice(0, 18)}... (derived)`);
+          console.log(`   💾 Vault:     ${path.basename(vaultPath)}`);
+        });
+
+        // Trigger offline sync to catch up on missed transfers
+        // This runs in the background and doesn't block the response
+        this.syncOfflineMessages(evmAddress.toLowerCase()).catch(err => {
+          console.warn(`   ⚠️ Offline sync failed (non-critical): ${err.message}`);
+        });
+
+        res.json({ success: true, message: 'Agent cryptography provisioned' });
+      } catch (err) {
+        console.error('[SESSION] Registration error:', err.message);
+        res.status(500).json({ success: false, error: err.message });
+      }
+    });
+
+    // GET /api/session/check/:evmAddress
+    app.get('/api/session/check/:evmAddress', (req, res) => {
+      const { evmAddress } = req.params;
+      if (!evmAddress) return res.status(400).json({ success: false, error: 'Missing evmAddress' });
+      
+      const session = this.sessions.get(evmAddress.toLowerCase());
+      if (session && session.secrets) {
+        return res.json({ 
+          success: true, 
+          exists: true,
+          provisionedAt: session.connectedAt 
+        });
+      }
+      
+      res.json({ success: true, exists: false });
+    });
+
+    // GET /api/session  — returns the session for a specific address
+    app.get('/api/session', (req, res) => {
+      const { evmAddress } = req.query;
+      const targetAddress = evmAddress ? evmAddress.toLowerCase() : null;
+      
+      const session = targetAddress ? this.sessions.get(targetAddress) : null;
+      
+      res.json({
+        success: true,
+        session: session
+          ? { accountId: session.evmAddress, evmAddress: session.evmAddress, walletType: session.walletType, connectedAt: session.connectedAt }
+          : null,
+        agentAccountId: this.accountId.toString()
+      });
+    });
+
+    // POST /api/session/disconnect
+    app.post('/api/session/disconnect', (req, res) => {
+      const { evmAddress } = req.body;
+      if (evmAddress) {
+        const target = evmAddress.toLowerCase();
+        console.log(`\n🔌 [SESSION] Wallet disconnected: ${target}`);
+        this.sessions.delete(target);
+      }
+      res.json({ success: true, message: 'Session cleared' });
+    });
+
+    // GET /api/vault/:accountId/fragments
+    app.get('/api/vault/:accountId/fragments', (req, res) => {
+      const address = req.params.accountId.toLowerCase();
+      this.sessionContext.run(address, () => {
+        const secretsMap = this.getSessionSecrets(address);
+        
+        const fragments = Array.from(secretsMap.values()).map(s => ({
+          id: s.id,
+          amount: s.amount,
+          commitment: s.commitment,
+          nullifier: s.nullifier,
+          secret: '*****', // Mask actual secret
+          status: s.used ? 'spent' : 'shielded'
+        }));
+        res.json({ success: true, fragments });
+      });
+    });
+
+    // GET /api/vault/:accountId/stealth
+    app.get('/api/vault/:accountId/stealth', (req, res) => {
+      const address = req.params.accountId.toLowerCase();
+      this.sessionContext.run(address, () => {
+        const stealthRecords = this.getStealthRecords(address);
+        const transfers = Array.from(stealthRecords.values())
+          .map(t => ({
+            id: t.id,
+            amount: t.payload.amount,
+            from: t.sender,
+            stealthAddress: t.payload.stealthAddress,
+            ephemeralPublicKey: t.payload.ephemeralPublicKey,
+            timestamp: t.timestamp,
+            status: t.claimed ? 'claimed' : 'unclaimed'
+          }));
+        res.json({ success: true, transfers });
+      });
+    });
+
+    // POST /api/command
+    app.post('/api/command', async (req, res) => {
+      const { command, evmAddress } = req.body;
+      // Auth intentionally removed to support MetaMask EVM addresses
+
+      if (!command || typeof command !== 'string') {
+        return res.status(400).json({ success: false, error: 'Command is required' });
+      }
+      if (!evmAddress) {
+        return res.status(400).json({ success: false, error: 'EVM Address is required to identify the session' });
+      }
+
+      try {
+        console.log(`\n🌐 [API COMMAND]: ${command}`);
+
+        // Parse command and remove --privacy flag if present (frontend sends it)
+        const cleanCommand = command.replace(/\s+--privacy\s+\d+/g, '').trim();
+        const parts = cleanCommand.toLowerCase().trim().split(/\s+/);
+        const cmd = parts[0];
+
+        // Supported commands that can be executed
+        const supportedCommands = [
+          'shield', 'shield-smart', 'ai-shield', 'ai-plan', 'consult',
+          'withdraw', 'stealth', 'transfer', 'internal-transfer', 'internal-swap', 'swap',
+          'public-transfer', 'status', 'shields', 'vault', 'balance', 'help',
+          'clear-pending', 'clear-failed-stealth', 'recover-stealth', 'scan-stealth', 'pending', 'debug-vault', 'claim'
+        ];
+
+        if (supportedCommands.includes(cmd)) {
+          // Execute command asynchronously inside the stateless session context
+          this.sessionContext.run(evmAddress.toLowerCase(), () => {
+            this.executeDirectCommand(cleanCommand, evmAddress.toLowerCase(), req.body.sandbox)
+              .then(result => {
+                console.log(`✅ Command result: ${result}`);
+              })
+              .catch(err => {
+                console.error(`❌ Command error: ${err.message}`);
+              });
+          });
+
+          res.json({
+            success: true,
+            actionId: Date.now().toString(),
+            message: `Executing ${cmd} command. Check the terminal console for real-time output.`
+          });
+        } else {
+          res.status(400).json({
+            success: false,
+            error: `Unknown command: ${cmd}. Available: ${supportedCommands.join(', ')}`
+          });
+        }
+      } catch (err) {
+        console.error('API Command Error:', err);
+        res.status(500).json({ success: false, error: err.message });
+      }
+    });
+
+    // POST /api/action/confirm
+    app.post('/api/action/confirm', async (req, res) => {
+      const { confirmationId } = req.body;
+      if (!confirmationId) return res.status(400).json({ success: false, error: 'confirmationId required' });
+      
+      const pending = this.pendingConfirmations.get(confirmationId);
+      if (pending) {
+        console.log(`✅ [API CONFIRM]: Ritual ${confirmationId} authorized by user.`);
+        pending.resolve(true);
+        this.pendingConfirmations.delete(confirmationId);
+        res.json({ success: true, message: 'Action authorized' });
+      } else {
+        res.status(404).json({ success: false, error: 'Confirmation ID not found or expired' });
+      }
+    });
+
+    // POST /api/action/cancel
+    app.post('/api/action/cancel', async (req, res) => {
+      const { confirmationId } = req.body;
+      if (!confirmationId) return res.status(400).json({ success: false, error: 'confirmationId required' });
+      
+      const pending = this.pendingConfirmations.get(confirmationId);
+      if (pending) {
+        console.log(`🛑 [API CANCEL]: Ritual ${confirmationId} rejected by user.`);
+        pending.resolve(false);
+        this.pendingConfirmations.delete(confirmationId);
+        res.json({ success: true, message: 'Action rejected' });
+      } else {
+        res.status(404).json({ success: false, error: 'Confirmation ID not found or expired' });
+      }
+    });
+
+    // POST /api/stealth/claim
+    app.post('/api/stealth/claim', async (req, res) => {
+      const { evmAddress, transferId } = req.body;
+      if (!evmAddress) {
+        return res.status(400).json({ success: false, error: 'evmAddress required' });
+      }
+
+      try {
+        console.log(`\n🌐 [API STEALTH CLAIM]: ${transferId} for ${evmAddress}`);
+        
+        this.sessionContext.run(evmAddress.toLowerCase(), () => {
+          const stealthRecords = this.getStealthRecords(evmAddress);
+          const transfer = stealthRecords.get(transferId);
+          if (transfer && !transfer.claimed) {
+            this.sweeperConfig = { enabled: true, delayMin: 0, delayMax: 0 };
+            this.claimStealthTransfer(
+              transfer.payload.stealthAddress, 
+              transfer.payload.amount, 
+              transfer.payload.ephemeralPublicKey, 
+              evmAddress
+            ).catch(err => console.error(`[API CLAIM ERROR] ${transferId}:`, err));
+          }
+        });
+        
+        res.json({ success: true, actionId: Date.now().toString(), message: 'Claim initiated' });
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // GET /api/balance/:accountId - Fetch real HBAR balance from Hedera
+    app.get('/api/balance/:accountId', async (req, res) => {
+      const { accountId } = req.params;
+      try {
+        const targetAccount = AccountId.fromString(accountId);
+        const balance = await new AccountBalanceQuery()
+          .setAccountId(targetAccount)
+          .execute(this.client);
+        const hbarBalance = parseFloat(balance.hbars.toString());
+        res.json({
+          success: true,
+          accountId,
+          balance: hbarBalance,
+          tinybars: balance.hbars.toTinybars().toString()
+        });
+      } catch (err) {
+        console.error(`[API BALANCE ERROR] ${accountId}:`, err.message);
+        res.status(500).json({ success: false, error: err.message });
+      }
+    });
+
+    // GET /api/ai/thoughts
+    app.get('/api/ai/thoughts', (req, res) => {
+      const { evmAddress } = req.query;
+      const history = this.logger.thoughtHistory || [];
+      const filtered = evmAddress 
+        ? history.filter(t => !t.evmAddress || t.evmAddress.toLowerCase() === evmAddress.toLowerCase())
+        : history;
+      res.json({ success: true, thoughts: filtered });
+    });
+
+    // GET /api/stream/thoughts — Real-time SSE endpoint for live terminal output
+    app.get('/api/stream/thoughts', (req, res) => {
+      // Set headers for Server-Sent Events
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders(); // Establish the connection immediately
+
+      // Define the listener functions
+      const sendLog = (logData) => {
+        res.write(`data: ${JSON.stringify(logData)}\n\n`);
+      };
+
+      const sendConfirmation = (data) => {
+        res.write(`event: confirmation-required\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      // Subscribe to the global log emitter
+      vanishLogEmitter.on('new-log', sendLog);
+      vanishLogEmitter.on('confirmation-required', sendConfirmation);
+
+      // Send initial connection message
+      sendLog({
+        timestamp: new Date().toISOString(),
+        text: '🔴 Connected to UserAgent log stream',
+        agent: 'UserAgent',
+        type: 'system'
+      });
+
+      // Cleanup when the frontend disconnects
+      req.on('close', () => {
+        vanishLogEmitter.off('new-log', sendLog);
+        vanishLogEmitter.off('confirmation-required', sendConfirmation);
+      });
+    });
+
+    const PORT = process.env.USER_AGENT_PORT || 3001;
+    app.listen(PORT, () => {
+      console.log(`\n🌐 Vanilla API Active: http://localhost:${PORT}`);
+      console.log(`   └─ Dashboard UI connectable for ${this.accountId}`);
+    });
+  }
+
+  /**
+   * Returns the cryptographic keys for the currently active wallet session.
+   * Prefers explicitly passed address, then AsyncLocalStorage context, then fallback.
+   */
+  getSessionKeys(evmAddress = null) {
+    const targetAddress = evmAddress || (this.sessionContext && this.sessionContext.getStore()) || this.activeSessionAddress;
+    if (targetAddress) {
+      const session = this.sessions.get(targetAddress.toLowerCase());
+      if (session) {
+        return { viewKey: session.viewKey, spendKey: session.spendKey };
+      }
+    }
+    // Fallback: .env keys (single-user / CLI mode)
+    return {
+      viewKey:  process.env.RECEIVER_VIEW_PRIVATE_KEY || process.env.HIP1334_ENC_PRIV_KEY || '',
+      spendKey: process.env.RECEIVER_SPEND_KEY        || '0xb3fbf0bf2e4ddbcdaf49973131719bc87fa0d8542e1b6cf17cca6f4aef43f330'
+    };
+  }
+
+  /**
+   * Returns the secrets Map for the currently active session context.
+   */
+  getSessionSecrets(evmAddress = null) {
+    const targetAddress = evmAddress || (this.sessionContext && this.sessionContext.getStore());
+    if (targetAddress) {
+      const session = this.sessions.get(targetAddress.toLowerCase());
+      if (session?.secrets) return session.secrets;
+    }
+    return this.userSecrets;
+  }
+
+  /**
+   * Saves secrets for the active session context back to disk using its unique vaultKey.
+   */
+  saveSessionSecrets(evmAddress = null) {
+    const targetAddress = evmAddress || (this.sessionContext && this.sessionContext.getStore());
+    if (targetAddress) {
+      const session = this.sessions.get(targetAddress.toLowerCase());
+      if (session?.vault) {
+        const obj = {};
+        for (const [k, v] of session.secrets.entries()) obj[k] = v;
+        session.vault.encrypt(obj, session.vaultKey);
+        return;
+      }
+    }
+    this.saveSecrets(); // Fallback to global vault
+  }
+
+  /**
+   * Sync offline messages from Mirror Node (Catch-Up Sync)
+   * Fetches HCS messages missed while the agent was offline and processes them.
+   * @param {string} evmAddress - The EVM address for the session to sync
+   */
+  async syncOfflineMessages(evmAddress) {
+    if (!evmAddress) {
+      console.warn('⚠️ syncOfflineMessages called without evmAddress');
+      return 0;
+    }
+
+    const session = this.sessions.get(evmAddress.toLowerCase());
+    if (!session) {
+      console.warn(`⚠️ No session found for ${evmAddress}, skipping offline sync`);
+      return 0;
+    }
+
+    const topicId = process.env.HIP1334_TOPIC_ID;
+    const encPrivateKey = process.env.HIP1334_ENC_PRIV_KEY;
+    const mirrorUrl = process.env.MIRROR_NODE_URL || 'https://testnet.mirrornode.hedera.com';
+
+    if (!topicId || !encPrivateKey) {
+      console.log('ℹ️  HIP-1334 not configured, skipping offline sync');
+      return 0;
+    }
+
+    // Get last sync timestamp from session or default to session start
+    const lastSyncTimestamp = session.lastSyncTimestamp || session.connectedAt || Date.now() - 86400000; // Default: 24 hours ago
+    const lastSyncSeconds = Math.floor(lastSyncTimestamp / 1000);
+
+    console.log(`🔄 Syncing offline messages for ${evmAddress.slice(0, 12)}...`);
+    console.log(`   Topic: ${topicId}`);
+    console.log(`   Since: ${new Date(lastSyncTimestamp).toISOString()}`);
+
+    try {
+      const axios = require('axios');
+      const { decryptMessage } = require('../../lib/hip1334.cjs');
+
+      // Fetch messages from Mirror Node
+      const msgUrl = `${mirrorUrl}/api/v1/topics/${topicId}/messages?timestamp=gt:${lastSyncSeconds}`;
+      const response = await axios.get(msgUrl, { timeout: 15000 });
+
+      const messages = response.data?.messages || [];
+      if (messages.length === 0) {
+        console.log(`   ✓ No new messages since last sync`);
+        session.lastSyncTimestamp = Date.now();
+        return 0;
+      }
+
+      console.log(`   📥 Found ${messages.length} message(s), processing...`);
+
+      let processedCount = 0;
+
+      for (const msg of messages) {
+        try {
+          // Decode base64 message
+          let raw = Buffer.from(msg.message, 'base64').toString('utf8');
+
+          // Handle double-encoded messages
+          if (raw.startsWith('eyJ')) {
+            raw = Buffer.from(raw, 'base64').toString('utf8');
+          }
+
+          const envelope = JSON.parse(raw);
+
+          // Skip init messages and non-HIP1334_MSG types
+          if (envelope.type === 'HIP1334_INIT') continue;
+          if (envelope.type !== 'HIP1334_MSG') continue;
+
+          // Decrypt the message
+          const plaintext = decryptMessage(envelope, encPrivateKey);
+          const payload = JSON.parse(plaintext);
+
+          // Check if this message is for this session's account
+          const myHederaId = session.hederaAccountId?.toString() || this.accountId.toString();
+
+          if (payload.type === 'SWEEP_COMPLETE') {
+            // Resolve the pending sponsored sweep Promise in the agent
+            this.handleSweepComplete(payload);
+            processedCount++;
+          } else if (payload.type === 'INTERNAL_SWAP' && payload.recipientAccountId === myHederaId) {
+            console.log(`   💰 Processing internal swap: ${payload.amount} HBAR from ${payload.senderAccountId}`);
+            await this.handleIncomingTransfer(payload);
+            processedCount++;
+          } else if (payload.type === 'STEALTH_TRANSFER') {
+            // For stealth transfers, we process regardless since the
+            // handleStealthTransfer function does multi-tenant matching
+            await this.handleStealthTransfer(payload);
+            processedCount++;
+          }
+        } catch (err) {
+          // Silent skip for messages we can't decrypt (not meant for us)
+          continue;
+        }
+      }
+
+      // Update last sync timestamp
+      session.lastSyncTimestamp = Date.now();
+
+      if (processedCount > 0) {
+        console.log(`   ✅ Sync complete! Processed ${processedCount} transfer(s)`);
+        console.log(`   💰 Current shielded balance: ${this.getShieldedBalanceForSession(evmAddress)} HBAR`);
+      } else {
+        console.log(`   ✓ Sync complete, no relevant transfers found`);
+      }
+
+      return processedCount;
+    } catch (error) {
+      console.error(`   ❌ Offline sync failed: ${error.message}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Get shielded balance for a specific session
+   */
+  getShieldedBalanceForSession(evmAddress) {
+    const session = this.sessions.get(evmAddress.toLowerCase());
+    if (!session?.secrets) return 0;
+
+    let total = 0;
+    for (const [_, data] of session.secrets.entries()) {
+      if (data.used !== true && data.amount) {
+        total += data.amount;
+      }
+    }
+    return total;
   }
 
   /**
@@ -190,14 +900,54 @@ class UserAgent {
     // Start listening for encrypted messages
     try {
       hip1334.listenToInbox(this.client, inboxTopicId, encPrivateKey, async (payload) => {
-        console.log(`📨 Received HIP-1334 message: ${payload.type}`);
-        if (payload.type === 'WITHDRAWAL_COMPLETE') {
-          this.handleWithdrawalComplete(payload);
+        // Iterate through all active sessions to find who this completion belongs to
+        for (const [evmAddress, session] of this.sessions) {
+          this.sessionContext.run(evmAddress, () => {
+             // Each session has its own pendingWithdrawals in its context?
+             // No, they are currently in the UserAgent class. 
+             // But we can check if the payload matches a pending withdrawal for this session.
+             if (payload.type === 'WITHDRAWAL_COMPLETE') {
+               this.handleWithdrawalComplete(payload);
+             } else if (payload.type === 'SHIELD_COMPLETE') {
+               this.handleShieldComplete(payload);
+             }
+          });
         }
       });
       console.log(`📬 Listening for completion notifications on ${inboxTopicId}`);
     } catch (err) {
       console.error('❌ Failed to start completion listener:', err.message);
+    }
+  }
+
+  /**
+   * Handle shield completion notification
+   * Unlike withdrawals, shields should NOT be marked as used! They are now ready to spend.
+   */
+  handleShieldComplete(notification) {
+    const { submissionId, status, recipientAccountId } = notification;
+
+    // Find the pending shield proof (they exist in pendingWithdrawals map until confirmed)
+    for (const [secretId, pending] of this.pendingWithdrawals) {
+      if (pending.submissionId === submissionId) {
+        if (status === 'SUCCESS') {
+          console.log(`\n✅ Shield successfully secured for fragment ${secretId}!`);
+          console.log(`   It is now fully available to be spent or withdrawn.`);
+
+          // We explicitly DO NOT mark secret.used = true here.
+          // It is a brand new fragment; it should stay unspent!
+          
+          // Remove from pending so `withdrawFunds` can see it available again!
+          this.pendingWithdrawals.delete(secretId);
+          this.savePendingWithdrawals();
+        } else {
+          console.log(`\n❌ Shield anchor failed for fragment ${secretId}: ${status}`);
+          // Keep it in pending or remove it? Let's remove it so it can be retried/cleared
+          this.pendingWithdrawals.delete(secretId);
+          this.savePendingWithdrawals();
+        }
+        return;
+      }
     }
   }
 
@@ -273,33 +1023,39 @@ class UserAgent {
     console.log(`📨 Listening for incoming transfers on topic ${inboxTopicId}...`);
 
     hip1334.listenToInbox(this.client, inboxTopicId, inboxPrivKey, async (payload) => {
-      // Debug: Log all received messages
-      console.log(`📨 [DEBUG] Received ${payload.type} message`);
-      if (payload.recipientAccountId) {
-        console.log(`   Recipient: ${payload.recipientAccountId}, My Account: ${this.accountId}`);
-      }
-
-      // Filter: Only process messages meant for this account (except STEALTH_TRANSFER which uses stealthAddress)
-      if (payload.type !== 'STEALTH_TRANSFER' && payload.recipientAccountId !== this.accountId.toString()) {
-        console.log(`   Filtered: Not for this account`);
+      // SWEEP_COMPLETE is a direct response to the agent itself (no session scoping needed)
+      if (payload.type === 'SWEEP_COMPLETE') {
+        console.log(`\n🗻 [SWEEP_COMPLETE] Pool Manager completed sponsored sweep`);
+        this.handleSweepComplete(payload);
         return;
       }
 
-      console.log(`📨 Processing message: ${payload.type}`);
+      // Logic: Iterate through ALL sessions and let each one try to handle it
+      for (const [evmAddress, session] of this.sessions) {
+        this.sessionContext.run(evmAddress, async () => {
+          const myHederaId = session.hederaAccountId?.toString() || this.accountId.toString();
+          
+          // Filter: Only process messages meant for this session's account
+          if (payload.type !== 'STEALTH_TRANSFER' && payload.recipientAccountId !== myHederaId) {
+            return; // Not for this session
+          }
 
-      if (payload.type === 'INTERNAL_SWAP') {
-        await this.handleIncomingTransfer(payload);
-      } else if (payload.type === 'INTERNAL_SWAP_ACK') {
-        console.log(`✅ Transfer acknowledged by recipient: ${payload.status}`);
-      } else if (payload.type === 'STEALTH_TRANSFER') {
-        // Check if this stealth transfer is for us by verifying the stealth address
-        await this.handleStealthTransfer(payload);
+          console.log(`📨 [SESSION:${evmAddress.slice(0,8)}] Processing ${payload.type}`);
+
+          if (payload.type === 'INTERNAL_SWAP') {
+            await this.handleIncomingTransfer(payload);
+          } else if (payload.type === 'INTERNAL_SWAP_ACK') {
+            console.log(`✅ Transfer acknowledged by recipient: ${payload.status}`);
+          } else if (payload.type === 'STEALTH_TRANSFER') {
+            await this.handleStealthTransfer(payload);
+          }
+        });
       }
     });
   }
 
   /**
-   * Handle incoming stealth transfer with AI-driven delayed auto-claim
+   * Handle incoming stealth transfer with multi-tenant session support
    */
   async handleStealthTransfer(payload) {
     const { stealthAddress, ephemeralPublicKey, amount, senderAccountId, recipientAccountId } = payload;
@@ -308,109 +1064,87 @@ class UserAgent {
     console.log(`   From: ${senderAccountId || 'Unknown'}`);
     console.log(`   Amount: ${amount} HBAR`);
     console.log(`   Stealth Address: ${stealthAddress}`);
-    console.log(`   Declared Recipient: ${recipientAccountId || 'Not specified'}`);
+    
+    // ---------------------------------------------------------------
+    // MULTI-TENANT MATCHING
+    // We iterate through all active sessions to see which one (if any)
+    // owns the view key that can decrypt this stealth transfer.
+    // ---------------------------------------------------------------
+    let matchingSession = null;
+    let matchingAddress = null;
 
-    // Check if this is actually for us
-    if (recipientAccountId && recipientAccountId !== this.accountId.toString()) {
-      console.log(`   ⚠️  Skipping: Not for this account (${this.accountId})`);
-      return;
-    }
-
-    // Verify we can derive the stealth key (proves it's for us)
-    // The sender uses our view PUBLIC key, we need our view PRIVATE key
-    const viewKey = process.env.RECEIVER_VIEW_PRIVATE_KEY || process.env.HIP1334_ENC_PRIV_KEY;
-    if (!viewKey || !ephemeralPublicKey) {
-      console.error(`   ❌ Missing keys to verify stealth transfer`);
-      console.error(`   ❌ RECEIVER_VIEW_PRIVATE_KEY or HIP1334_ENC_PRIV_KEY must be set`);
-      return;
-    }
-
-    // Validate we can derive the key AND that it matches the expected address
-    try {
-      const derivedKey = this.deriveStealthPrivateKey(ephemeralPublicKey, viewKey, stealthAddress);
-      if (!derivedKey) {
-        console.log(`   ⚠️  Cannot derive key for this stealth address - skipping (not for us)`);
-        return;
+    if (this.sessions.size === 0) {
+      console.log('   ⚠️ No active sessions connected to Agent. Checking .env fallback...');
+      // Fallback check for CLI/Single-user mode
+      const fallbackKeys = this.getSessionKeys();
+      try {
+        const derived = this.deriveStealthPrivateKey(ephemeralPublicKey, fallbackKeys.viewKey, stealthAddress);
+        if (derived) {
+          matchingAddress = this.activeSessionAddress || 'global';
+          matchingSession = { secrets: this.userSecrets, vaultKey: null }; // Global context
+        }
+      } catch (e) { /* ignore */ }
+    } else {
+      for (const [address, session] of this.sessions.entries()) {
+        try {
+          const derived = this.deriveStealthPrivateKey(ephemeralPublicKey, session.viewKey, stealthAddress, address);
+          if (derived) {
+            console.log(`   🎯 MATCH FOUND: This transfer belongs to session ${address}`);
+            matchingSession = session;
+            matchingAddress = address;
+            break;
+          }
+        } catch (e) {
+          // Not for this session, keep looking
+        }
       }
-      // If deriveStealthPrivateKey logged a warning about mismatch, we should check
-      // The function already logs if there's a mismatch, so we just need to verify
-    } catch (e) {
-      console.error(`   ❌ Key derivation failed: ${e.message}`);
+    }
+
+    if (!matchingSession) {
+      console.log(`   ⚠️  No session could derive a key for this stealth address - skipping.`);
       return;
     }
 
-    console.log(`   ✅ Verified: This stealth transfer is for us!`);
+    console.log(`   ✅ Verified: This stealth transfer is for ${matchingAddress}!`);
 
-    // Store stealth keys in vault for claiming
+    // Store stealth keys in the correct session's vault
     const stealthId = `stealth_${Date.now()}`;
     const parsedAmount = parseFloat(amount) || 0;
 
-    if (parsedAmount <= 0) {
-      console.error(`   ❌ Invalid amount in stealth transfer: ${amount}`);
-      return;
-    }
-
-    this.userSecrets.set(stealthId, {
+    const secrets = matchingSession.secrets || this.userSecrets;
+    secrets.set(stealthId, {
       type: 'stealth_pending',
       stealthAddress,
-      ephemeralPublicKey,  // Store this to derive the private key later
+      ephemeralPublicKey,
       amount: parsedAmount,
       sender: senderAccountId,
       receivedAt: Date.now(),
       status: 'PENDING_CLAIM'
     });
-    this.saveSecrets();
+    this.saveSessionSecrets(matchingAddress);
 
-    console.log(`   🔑 Ephemeral key stored: ${ephemeralPublicKey?.slice(0, 20)}...`);
-    console.log(`   💡 Use 'claim ${stealthId}' to sweep funds manually`);
-
-    // AI-Driven Delay: Analyze network for optimal claim timing
+    // AI-Driven Delay scheduled within the session context
     const delayMs = await this.calculateStealthClaimDelay();
-    const privacyScore = this.calculatePrivacyScore(delayMs);
+    console.log(`   ⏳ Auto-claim scheduled in ${(delayMs / 1000).toFixed(1)}s for ${matchingAddress}...\n`);
 
-    console.log(`\n🧠 AI Privacy Analysis:`);
-    console.log(`   Temporal Correlation Risk: ${privacyScore.riskLevel}`);
-    console.log(`   Recommended Delay: ${(delayMs / 1000).toFixed(1)}s`);
-    console.log(`   Privacy Score: ${privacyScore.score}%`);
-    console.log(`   ⏳ Auto-claim scheduled...\n`);
-
-    // Schedule auto-claim with delay
     setTimeout(async () => {
-      try {
-        console.log(`\n🚀 Executing delayed stealth claim for ${stealthId}...`);
-        console.log(`   Amount: ${parsedAmount} HBAR`);
-        console.log(`   Stealth Address: ${stealthAddress}`);
+      // Run the claim inside the session context for stateless execution
+      this.sessionContext.run(matchingAddress, async () => {
+        try {
+          console.log(`\n🚀 Executing delayed stealth claim for ${stealthId} (${matchingAddress})...`);
+          const result = await this.claimStealthTransfer(stealthAddress, parsedAmount, ephemeralPublicKey, matchingAddress);
+          console.log(result);
 
-        const result = await this.claimStealthTransfer(stealthAddress, parsedAmount, ephemeralPublicKey);
-        console.log(result);
-
-        // Update vault status
-        const secret = this.userSecrets.get(stealthId);
-        if (secret) {
-          if (result.includes('✅ Stealth Claim Complete')) {
-            secret.status = 'CLAIMED';
-            console.log(`   ✅ Marked ${stealthId} as CLAIMED in vault`);
-          } else {
-            secret.status = 'CLAIM_FAILED';
-            console.error(`   ❌ Auto-claim failed for ${stealthId}: ${result}`);
+          const secret = secrets.get(stealthId);
+          if (secret) {
+            secret.status = result.includes('✅ Stealth Claim Complete') ? 'CLAIMED' : 'CLAIM_FAILED';
+            secret.claimedAt = Date.now();
+            this.saveSessionSecrets(matchingAddress);
           }
-          secret.claimedAt = Date.now();
-          this.saveSecrets();
-        } else {
-          console.warn(`   ⚠️ Could not update vault: ${stealthId} not found`);
+        } catch (err) {
+          console.error(`\n❌ Auto-claim failed for ${stealthId}:`, err.message);
         }
-      } catch (err) {
-        console.error(`\n❌ Auto-claim failed for ${stealthId}:`, err.message);
-        console.error(`   Stack:`, err.stack);
-        // Mark for manual retry
-        const secret = this.userSecrets.get(stealthId);
-        if (secret) {
-          secret.status = 'CLAIM_FAILED';
-          secret.claimError = err.message;
-          secret.claimedAt = Date.now();
-          this.saveSecrets();
-        }
-      }
+      });
     }, delayMs);
   }
 
@@ -490,7 +1224,7 @@ class UserAgent {
    * 
    * This ensures the derived public key will match the stealth address created by sender
    */
-  deriveStealthPrivateKey(ephemeralPublicKey, viewPrivateKey, expectedStealthAddress = null) {
+  deriveStealthPrivateKey(ephemeralPublicKey, viewPrivateKey, expectedStealthAddress = null, evmAddress = null) {
     try {
       if (!ephemeralPublicKey || !viewPrivateKey) {
         console.error('❌ Missing keys for stealth derivation');
@@ -510,8 +1244,9 @@ class UserAgent {
         return null;
       }
 
-      // Get the spend private key (this is the base private key)
-      const spendKeyHex = process.env.RECEIVER_SPEND_KEY || '0xb3fbf0bf2e4ddbcdaf49973131719bc87fa0d8542e1b6cf17cca6f4aef43f330';
+      // Get the spend private key for the specific session
+      const keys = this.getSessionKeys(evmAddress);
+      const spendKeyHex = keys.spendKey;
       const spendPrivateKeyHex = spendKeyHex.replace('0x', '');
 
       // Convert to BigInt for elliptic curve math
