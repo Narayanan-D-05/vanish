@@ -73,3 +73,17 @@ tmp/
 tmp_verify_fix.cjs
 config/*.json
 !config/default_policy.json
+
+# Scratch logs and outputs (root level)
+err.json
+exports.json
+fragments.json
+register-out.json
+*.patch
+index.patch
+full_index.patch
+part1.patch
+part2.patch
+!package.json
+!package-lock.json
+!composer.json
