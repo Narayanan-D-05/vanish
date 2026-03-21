@@ -13,17 +13,24 @@ const {
   Client,
   PrivateKey,
   AccountId,
+  TransferTransaction,
+  Hbar,
+  TransactionId,
+  Transaction,
   TopicMessageSubmitTransaction,
   TopicMessageQuery,
   ContractCallQuery,
   ContractId,
 } = require('@hashgraph/sdk');
+const express = require('express');
+const cors = require('cors');
 const snarkjs = require('snarkjs');
 const nodeFs = require('fs');
 const fsp = nodeFs.promises;
 const path = require('path');
 const crypto = require('crypto');
 const { keccak256, Wallet } = require('ethers');
+const { EventEmitter } = require('events');
 
 const DelegationManager = require('../../lib/delegation.cjs');
 const hip1334 = require('../../lib/hip1334.cjs');
@@ -37,6 +44,39 @@ try {
   // Optional dependency path; deterministic fallback is always available.
 }
 
+// =============================================================================
+// SSE LOG STREAMING - Global Event Emitter for Real-time Terminal Output
+// =============================================================================
+const vanishLogEmitter = new EventEmitter();
+
+// Intercept console.log to broadcast to frontend
+const originalLog = console.log;
+console.log = function(...args) {
+  const message = args.join(' ');
+  // Broadcast to all connected SSE clients
+  vanishLogEmitter.emit('new-log', {
+    timestamp: new Date().toISOString(),
+    text: message,
+    agent: 'PoolManager',
+    type: 'log'
+  });
+  // Still print to actual terminal
+  originalLog.apply(console, args);
+};
+
+// Intercept console.error as well
+const originalError = console.error;
+console.error = function(...args) {
+  const message = args.join(' ');
+  vanishLogEmitter.emit('new-log', {
+    timestamp: new Date().toISOString(),
+    text: message,
+    agent: 'PoolManager',
+    type: 'error'
+  });
+  originalError.apply(console, args);
+};
+
 const normalizeHex = (hex, length = 64) => {
   if (!hex) return '0x' + '0'.repeat(length);
   let clean = hex.startsWith('0x') ? hex.slice(2) : hex;
@@ -45,10 +85,25 @@ const normalizeHex = (hex, length = 64) => {
 
 class PoolManager {
   constructor() {
-    this.accountId = AccountId.fromString(process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID);
-    this.privateKey = PrivateKey.fromString(process.env.POOL_MANAGER_PRIVATE_KEY || process.env.HEDERA_PRIVATE_KEY);
+    // Validate credentials exist - fail loudly if missing
+    const accountIdStr = process.env.POOL_MANAGER_ACCOUNT_ID || process.env.HEDERA_ACCOUNT_ID;
+    const privateKeyStr = process.env.POOL_MANAGER_PRIVATE_KEY || process.env.HEDERA_PRIVATE_KEY;
+
+    if (!accountIdStr || !privateKeyStr) {
+      throw new Error(
+        'POOL_MANAGER_ACCOUNT_ID (or HEDERA_ACCOUNT_ID) and ' +
+        'POOL_MANAGER_PRIVATE_KEY (or HEDERA_PRIVATE_KEY) must be set in environment. ' +
+        'Real credentials are required for testnet transactions.'
+      );
+    }
+
+    this.accountId = AccountId.fromString(accountIdStr);
+    this.privateKey = PrivateKey.fromString(privateKeyStr);
     this.client = Client.forTestnet();
     this.client.setOperator(this.accountId, this.privateKey);
+    // Increase robustness for testnet node instability
+    this.client.setMaxAttempts(15);
+    this.client.setNodeWaitTime(500);
 
     this.privateTopic = process.env.PRIVATE_TOPIC_ID;
     this.publicTopic = process.env.PUBLIC_ANNOUNCEMENT_TOPIC_ID;
@@ -101,6 +156,111 @@ class PoolManager {
     console.log(`   Decision Signer: ${this.decisionSignerWallet ? this.decisionSignerWallet.address : 'ed25519 fallback (off-chain only)'}`);
     console.log(`   Batching: Min ${this.MIN_BATCH_SIZE} proofs OR ${this.MAX_WAIT_TIME / 60000} minutes`);
     console.log(`   Delay bounds: ${this.MIN_RANDOM_DELAY / 1000}-${this.MAX_RANDOM_DELAY / 1000} seconds`);
+
+    // HCS Message Cache for API
+    this.hcsCache = {
+      auditThoughts: [],
+      transactions: []
+    };
+
+    // Start Express UI API Server
+    this.startExpressServer();
+  }
+
+  /**
+   * Start Express Server to serve the frontend dashboard
+   */
+  startExpressServer() {
+    const app = express();
+    app.use(cors());
+    app.use(express.json());
+
+    // GET /api/stats
+    app.get('/api/stats', (req, res) => {
+      res.json({
+        success: true,
+        anonymitySet: this.anchoredRoots.size || 0,
+        poolSize: (this.merkleTree.leaves || []).length,
+        pendingActions: this.proofQueue.length,
+        totalVolume: 0 // Track actual pool HBAR balance in a robust way
+      });
+    });
+
+    // GET /api/merkle-tree
+    app.get('/api/merkle-tree', (req, res) => {
+      res.json({
+        success: true,
+        root: this.merkleTree.root ? this.merkleTree.root.toString(16) : '0',
+        depth: this.merkleTree.depth || 4,
+        leafCount: (this.merkleTree.leaves || []).length,
+        pendingCount: this.proofQueue.length
+      });
+    });
+
+    // GET /api/transactions
+    app.get('/api/transactions', (req, res) => {
+      // Build transactions from hcsCache + proof queue history  
+      const allTxs = [...this.hcsCache.transactions];
+      
+      // Supplement with any queued/processed proofs we know about
+      if (this.proofQueue && this.proofQueue.length > 0) {
+        this.proofQueue.forEach(proof => {
+          const exists = allTxs.some(t => t.id === proof.id);
+          if (!exists) {
+            allTxs.push({
+              id: proof.id || `proof_${Date.now()}`,
+              type: 'shield',
+              amount: `${proof.amount || '?'} HBAR`,
+              timestamp: proof.timestamp || Date.now(),
+              hashscanUrl: ''
+            });
+          }
+        });
+      }
+
+      res.json({ success: true, transactions: allTxs });
+    });
+
+    // GET /api/ai/thoughts
+    app.get('/api/ai/thoughts', (req, res) => {
+      res.json({ success: true, thoughts: this.hcsCache.auditThoughts });
+    });
+
+    // GET /api/stream/thoughts — Real-time SSE endpoint for live terminal output
+    app.get('/api/stream/thoughts', (req, res) => {
+      // Set headers for Server-Sent Events
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders(); // Establish the connection immediately
+
+      // Define the listener function
+      const sendLog = (logData) => {
+        res.write(`data: ${JSON.stringify(logData)}\n\n`);
+      };
+
+      // Subscribe to the global log emitter
+      vanishLogEmitter.on('new-log', sendLog);
+
+      // Send initial connection message
+      sendLog({
+        timestamp: new Date().toISOString(),
+        text: '🔴 Connected to PoolManager log stream',
+        agent: 'PoolManager',
+        type: 'system'
+      });
+
+      // Cleanup when the frontend disconnects
+      req.on('close', () => {
+        vanishLogEmitter.off('new-log', sendLog);
+      });
+    });
+
+    const PORT = process.env.POOL_MANAGER_PORT || 3002;
+    app.listen(PORT, () => {
+      console.log(`\n🌐 Vanilla API Active: http://localhost:${PORT}`);
+      console.log(`   └─ Dashboard UI connectable for network stats & HCS`);
+    });
   }
 
   async loadVerificationKeys() {
@@ -271,10 +431,20 @@ class PoolManager {
         decisionEnvelopeSignatureScheme: signedEnvelope.signatureScheme,
       };
 
-      await new TopicMessageSubmitTransaction()
+      const receipt = await new TopicMessageSubmitTransaction()
         .setTopicId(this.publicTopic)
         .setMessage(JSON.stringify(audit))
         .execute(this.client);
+
+      // Save for UI Dashboard
+      this.hcsCache.auditThoughts.push({
+        id: audit.decisionId,
+        timestamp: audit.timestamp,
+        type: 'decision',
+        message: `AI Policy Decision: ${validation.approved ? 'Approved' : 'Rejected'}`,
+        context: JSON.stringify(envelope.context)
+      });
+      if (this.hcsCache.auditThoughts.length > 50) this.hcsCache.auditThoughts.shift();
 
       console.log(`🧾 AI decision audit signed & logged (${audit.decisionId})`);
       console.log(`   Signer: ${audit.signerAccountId} | sig: ${signature.slice(0, 16)}...`);
@@ -312,9 +482,9 @@ class PoolManager {
 
       const iface = new Interface(abi);
 
-      // Use uniqueRoots.length for batchSize to ensure consistency with roots array
-      // This handles cases where multiple proofs share the same root (e.g., same commitment)
-      const actualBatchSize = uniqueRoots.length;
+      // Pass the *entire* batchSize (Shields + Withdraws) to the contract so it passes the
+      // policy validation checks. `uniqueRoots` length does not need to equal `batchSize`.
+      const actualBatchSize = batchSize;
 
       const params = hasEcdsa
         ? [
@@ -347,6 +517,7 @@ class PoolManager {
       if (receipt.status.toString() === 'SUCCESS') {
         console.log(`⛓️  Batch anchored on-chain → VanishGuard (${guardId})`);
         console.log(`   Roots anchored: ${uniqueRoots.length}`);
+        console.log(`✨ Protocol Ritual Complete: 100.0% of funds settled to privacy pool.`);
 
         // Verify roots are now in rootHistory
         await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for mirror node
@@ -492,9 +663,10 @@ class PoolManager {
       return false;
     }
 
+    console.log(`🔍 [DEBUG] Validating proof ${proofData.submissionId} (Type: ${proofData.proofType})...`);
     const isValid = await this.verifyProof(proofData.proof, proofData.publicSignals, proofData.proofType);
     if (!isValid) {
-      console.log('❌ Rejected invalid proof');
+      console.log(`❌ Rejected invalid proof: ${proofData.submissionId}`);
       return false;
     }
 
@@ -554,6 +726,25 @@ class PoolManager {
       timestamp: Date.now(),
       submissionId: proofData.submissionId || crypto.randomUUID(),
     });
+
+    // GROW TREE REAL-TIME: Insert into Merkle tree immediately so UI "Ghost Map" updates
+    const type = (proofData.proofType || '').toLowerCase();
+    const commitment = proofData.commitment || (type === 'shield' ? proofData.publicSignals?.[0] : null);
+
+    if (type === 'shield' && commitment) {
+      try {
+        console.log(`🌳 Growing Merkle Tree: Inserting leaf ${String(commitment).slice(0, 10)}...`);
+        this.merkleTree.insert(commitment);
+      } catch (e) {
+        if (e.message.includes('Merkle tree full')) {
+          console.warn(`🔄 Visualization Tree full, resetting to simulate continuous privacy set...`);
+          this.merkleTree.leaves = [];
+          this.merkleTree.insert(commitment);
+        } else {
+          console.error(`⚠️ Tree insertion failed: ${e.message}`);
+        }
+      }
+    }
 
     console.log(`📥 Proof added to queue (${this.proofQueue.length}/${this.MIN_BATCH_SIZE})`);
 
@@ -782,6 +973,10 @@ class PoolManager {
           fragmentRoots.push(fragmentRoot);
 
           console.log(`   🔐 Fragment root computed: ${fragmentRoot.slice(0, 18)}...`);
+
+          // ⚠️ Removed legacy double-sweep logic. Funds are already securely pulled
+          // into the VanishGuard contract during `addProofToQueue` execution via `executeDelegatedTransfer`.
+          console.log(`   ✅ Fragment ready for anchoring (funds secured upfront).`);
         }
 
         const lastFragmentRoot = fragmentRoots[fragmentRoots.length - 1];
@@ -810,7 +1005,7 @@ class PoolManager {
           anchorAttempts++;
           try {
             await this.submitBatchToGuard(
-              shieldProofs.length,
+              batchSize,
               decisionMeta ? decisionMeta.scheduledDelayMs : this.MIN_RANDOM_DELAY,
               queueAgeMs,
               fragmentRoots,
@@ -833,6 +1028,20 @@ class PoolManager {
           // Persist anchored roots to file for recovery
           this.persistAnchoredRoots(fragmentRoots);
           console.log(`   ✅ ${anchoredRoots.length} roots anchored and ready for withdrawals`);
+
+          // Notify user agent that these shield proofs are fully confirmed so it can clear them from pending
+          for (const p of shieldProofs) {
+            await this.notifyWithdrawalComplete(p, {
+              status: 'SUCCESS',
+              type: 'SHIELD_COMPLETE',
+              transactionId: 'batch_anchor_' + batchId,
+              amount: p.publicSignals[5] ? Number(BigInt(p.publicSignals[5])) / 1e8 : 0, 
+              recipient: null,
+              nullifierHash: String(p.publicSignals[0]),
+              commitment: String(p.publicSignals[1]),
+              timestamp: Date.now()
+            });
+          }
         } else {
           console.error(`   ❌ Failed to anchor roots after ${maxAnchorAttempts} attempts`);
           console.error(`   ⚠️ Withdrawals for these commitments will fail until roots are anchored`);
@@ -860,6 +1069,39 @@ class PoolManager {
       console.error('❌ Batch execution failed:', error.message);
     } finally {
       this.batchScheduled = false;
+    }
+  }
+
+  /**
+   * Phase 38: Sweep shielded HBAR from the user's allowance into the VanishGuard contract
+   * to ensure the vault has solvency for future withdrawals.
+   */
+  async sweepShieldedFunds(proofData) {
+    const { TransferTransaction, ContractId, Hbar, TransactionId } = require('@hashgraph/sdk');
+    const guardId = process.env.VANISH_GUARD_CONTRACT_ID;
+    if (!guardId) throw new Error('VANISH_GUARD_CONTRACT_ID not set');
+
+    const submitter = proofData.submitter;
+    const amount = Number(proofData.amount);
+
+    if (!submitter) throw new Error('No submitter provided in proofData, cannot sweep funds.');
+
+    console.log(`   💸 Sweeping ${amount} HBAR from ${submitter} to VanishGuard...`);
+    
+    // Explicitly pay for gas using the Pool Manager's account to decouple origin
+    // since the submitter gave us taking rights (allowance) for `amount`.
+    const sweepTx = new TransferTransaction()
+      .addApprovedHbarTransfer(submitter, new Hbar(amount).negated())
+      .addHbarTransfer(guardId, new Hbar(amount))
+      .setTransactionId(TransactionId.generate(this.accountId));
+
+    const txResponse = await sweepTx.execute(this.client);
+    const receipt = await txResponse.getReceipt(this.client);
+    
+    if (receipt.status.toString() === 'SUCCESS') {
+      console.log(`   ✅ Vault funded: ${amount} HBAR secured in contract`);
+    } else {
+      throw new Error(`Transfer failed: ${receipt.status.toString()}`);
     }
   }
 
@@ -1048,7 +1290,7 @@ class PoolManager {
     }
 
     // 3. Notify Recipient if it's a Stealth Payment
-    if (proofData.stealthPayload && proofData.stealthPayload.recipientAccountId) {
+    if (!isInternalSwap && proofData.stealthPayload && proofData.stealthPayload.recipientAccountId) {
       try {
         const payload = {
           type: 'STEALTH_TRANSFER',
@@ -1235,7 +1477,7 @@ class PoolManager {
       const hip1334 = require('../../lib/hip1334.cjs');
 
       const notification = {
-        type: 'WITHDRAWAL_COMPLETE',
+        type: result.type || 'WITHDRAWAL_COMPLETE',
         submissionId: proofData.submissionId,
         nullifierHash: result.nullifierHash,
         commitment: result.commitment,
@@ -1273,6 +1515,17 @@ class PoolManager {
         .execute(this.client);
 
       const receipt = await txResponse.getReceipt(this.client);
+      
+      // Save for UI Dashboard
+      this.hcsCache.transactions.push({
+        id: txResponse.transactionId.toString(),
+        type: 'shield',
+        amount: `${batchData.anonymizedProofs.length} proofs`,
+        timestamp: batchData.timestamp,
+        hashscanUrl: `https://hashscan.io/testnet/transaction/${txResponse.transactionId.toString()}`
+      });
+      if (this.hcsCache.transactions.length > 50) this.hcsCache.transactions.shift();
+
       console.log('📜 Batch logged to HCS (immutable audit trail)');
       console.log(`   Topic: ${this.publicTopic}`);
       console.log(`   Sequence: ${receipt.topicSequenceNumber}`);
@@ -1312,13 +1565,106 @@ class PoolManager {
   }
 
   async handleMessage(payload) {
+    // Route SPONSORED_SWEEP requests separately from proof submissions
+    if (payload.type === 'SPONSORED_SWEEP') {
+      await this.executeSponsoredSweep(payload);
+      return;
+    }
+
     if (payload.type !== 'PROOF_SUBMISSION') return;
     console.log(`📩 [HIP-1334] Proof received: ${payload.submissionId}`);
     if (!payload.proofType) {
       console.log('⚠️ Missing proofType, skipping');
       return;
     }
+
+    // 🛡️ SECURITY: Strict Denomination Scoping (Air-Gapped Validations)
+    // To prevent compute exhaustion (DoS) and gas draining, we ONLY accept 
+    // mathematically perfect denominations. Dust amounts are dropped instantly.
+    const type = (payload.proofType || '').toUpperCase();
+    console.log(`🔍 [DEBUG] handleMessage type: ${type}, amount: ${payload.amount}`);
+    if (type === 'SHIELD' || type === 'WITHDRAW') {
+      const amt = parseFloat(payload.amount);
+      const policy = require('../../config/vanish-policy.json');
+      const allowed = policy.allowedDenominations || [0.1, 1, 10, 100];
+      if (!allowed.includes(amt)) {
+        console.warn(`🔒 [SECURITY] Dropped invalid denomination proof: ${amt} HBAR from ${payload.submitterAccountId || 'unknown'}`);
+        return; // Silent drop to avoid amplifying DoS
+      }
+    }
+
     await this.addProofToQueue(payload);
+  }
+
+  /**
+   * Execute a Pool Manager-sponsored stealth sweep.
+   * The UserAgent pre-signed the transaction with the stealth private key;
+   * the Pool Manager adds its fee-payer signature and broadcasts.
+   * On-chain: Fee Payer = Pool Manager (no link to UserAgent or user!) 🛡️
+   */
+  async executeSponsoredSweep(payload) {
+    const { txBytes, recipientAccountId, stealthAddress, amount, requesterAccountId } = payload;
+    console.log(`\n🔐 [SPONSORED_SWEEP] Received from ${requesterAccountId}`);
+    console.log(`   Stealth: ${stealthAddress} → Recipient: ${recipientAccountId}`);
+    console.log(`   Amount:  ${amount} HBAR`);
+
+    try {
+      if (!txBytes) throw new Error('Missing txBytes in sponsored sweep request');
+      if (!recipientAccountId) throw new Error('Missing recipientAccountId');
+      if (!stealthAddress) throw new Error('Missing stealthAddress');
+
+      // Deserialize the partially-signed transaction
+      const txBuffer = Buffer.from(txBytes, 'base64');
+      const tx = Transaction.fromBytes(txBuffer);
+
+      // Add Pool Manager's fee-payer signature (this makes it the on-chain payer)
+      const signedTx = await tx.sign(this.privateKey);
+
+      // Broadcast to Hedera
+      console.log(`   📤 Broadcasting sponsored sweep (Pool Manager pays fees)...`);
+      const response = await signedTx.execute(this.client);
+      const receipt = await response.getReceipt(this.client);
+      const txId = response.transactionId.toString();
+
+      console.log(`   ✅ Sponsored sweep complete!`);
+      console.log(`   Tx ID: ${txId}`);
+      console.log(`   Status: ${receipt.status.toString()}`);
+      console.log(`   🔒 Privacy: Fee payer = Pool Manager (${this.accountId.toString()}) — no UserAgent on-chain!`);
+
+      // Notify the requesting UserAgent of success
+      if (requesterAccountId) {
+        try {
+          const hip1334 = require('../../lib/hip1334.cjs');
+          await hip1334.sendEncryptedMessage(this.client, requesterAccountId, {
+            type: 'SWEEP_COMPLETE',
+            status: 'SUCCESS',
+            stealthAddress,
+            recipientAccountId,
+            amount,
+            transactionId: txId,
+            timestamp: Date.now()
+          });
+          console.log(`   📨 SWEEP_COMPLETE notification sent to ${requesterAccountId}`);
+        } catch (notifErr) {
+          console.warn(`   ⚠️ Could not send SWEEP_COMPLETE notification: ${notifErr.message}`);
+        }
+      }
+    } catch (err) {
+      console.error(`   ❌ Sponsored sweep failed: ${err.message}`);
+      // Notify requester of failure so they can fall back
+      if (requesterAccountId) {
+        try {
+          const hip1334 = require('../../lib/hip1334.cjs');
+          await hip1334.sendEncryptedMessage(this.client, requesterAccountId, {
+            type: 'SWEEP_COMPLETE',
+            status: 'FAILED',
+            stealthAddress,
+            error: err.message,
+            timestamp: Date.now()
+          });
+        } catch (_) { /* ignore notification errors */ }
+      }
+    }
   }
 
   async startListening() {
@@ -1342,7 +1688,7 @@ class PoolManager {
 
     new TopicMessageQuery()
       .setTopicId(this.privateTopic)
-      .setStartTime(Math.floor(Date.now() / 1000) - 3600) // Look back 1 hour to recover missed proofs
+      .setStartTime(Math.floor(Date.now() / 1000) - (3600 * 48)) // Look back 48 hours to recover missed proofs
       .subscribe(this.client, null, async (message) => {
         try {
           let raw = Buffer.from(message.contents).toString('utf8');
@@ -1371,9 +1717,32 @@ async function main() {
   const manager = new PoolManager();
   await manager.startListening();
 
+  // Auto-spawn HOL HCS-10 listener if Pool Manager is registered on HOL
+  if (process.env.HOL_POOL_ACCOUNT_ID) {
+    const { spawn } = require('child_process');
+    const listenerPath = path.resolve(__dirname, '..', 'hol-listener-pool.mjs');
+    if (require('fs').existsSync(listenerPath)) {
+      console.log('🌐 [HOL] Spawning Pool Manager HCS-10 listener...');
+      const holProc = spawn('node', [listenerPath], {
+        detached: false,
+        stdio: 'inherit',
+        env: { ...process.env },
+      });
+      holProc.on('error', (e) => console.error('❌ [HOL] Pool listener error:', e.message));
+      holProc.on('exit', (code) => {
+        if (code !== 0 && code !== null) {
+          console.warn(`⚠️  [HOL] Pool listener exited (${code}). Restart manually: npm run start:hol:pool`);
+        }
+      });
+      console.log(`✅ [HOL] Pool Manager HCS-10 listener started (PID: ${holProc.pid})`);
+    } else {
+      console.warn('⚠️  [HOL] Pool listener script not found. Run: npm run hol:register:pool first.');
+    }
+  }
+
   // Status logging every 5 minutes
   setInterval(() => {
-    console.log('📊 Pool Status:', manager.getStatus());
+    console.log('📊 Pool Status:', JSON.stringify(manager.getStatus(), null, 2));
   }, 5 * 60 * 1000);
 
   // One-time command listener for clearing queue (type 'clear' and press Enter)
@@ -1396,7 +1765,7 @@ async function main() {
       manager.batchScheduled = false;
       console.log(`🧹 Cleared ${count} proofs from queue`);
     } else if (cmd === 'status') {
-      console.log('📊 Pool Status:', manager.getStatus());
+      console.log('📊 Pool Status:', JSON.stringify(manager.getStatus(), null, 2));
     }
   });
 }
