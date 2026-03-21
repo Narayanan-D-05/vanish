@@ -11,6 +11,7 @@ const {
   AccountId,
   AccountBalanceQuery,
   TransferTransaction,
+  AccountAllowanceApproveTransaction,
   Hbar,
   TopicMessageSubmitTransaction
 } = require('@hashgraph/sdk');
@@ -136,11 +137,16 @@ class PolicyGuard {
 // Create global PolicyGuard instance
 const policyGuard = new PolicyGuard();
 
-// Helper to get Hedera Client
+// Helper to get Hedera Client - fails loudly if credentials missing
 function getClient() {
   const accountId = process.env.HEDERA_ACCOUNT_ID;
   const privateKey = process.env.HEDERA_PRIVATE_KEY;
-  if (!accountId || !privateKey) return null;
+  if (!accountId || !privateKey) {
+    throw new Error(
+      'HEDERA_ACCOUNT_ID and HEDERA_PRIVATE_KEY must be set in environment. ' +
+      'Real credentials are required for testnet transactions.'
+    );
+  }
   const client = Client.forTestnet();
   client.setOperator(AccountId.fromString(accountId), PrivateKey.fromString(privateKey));
   return client;
