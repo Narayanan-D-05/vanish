@@ -87,3 +87,6 @@ part2.patch
 !package.json
 !package-lock.json
 !composer.json
+
+# Session State
+sessions_state.json
