@@ -403,11 +403,19 @@ const generateWithdrawProofTool = new DynamicStructuredTool({
 
       const commitmentHash = poseidon.F.toString(poseidon([nullifierBigInt, secretBigInt, amountTinybars]));
 
+      // Handle both 0.0.x Hedera formats and 0x... hex formats (like the zero address)
+      let recipientBigIntStr;
+      if (recipient.startsWith('0x')) {
+        recipientBigIntStr = BigInt(recipient).toString();
+      } else {
+        recipientBigIntStr = recipient.replace('0.0.', '');
+      }
+
       const input = {
         nullifierHash: nullifierHashComputed,
         commitment: commitmentHash,
         root: [rootLow.toString(), rootHigh.toString()],
-        recipient: recipient.replace('0.0.', ''),
+        recipient: recipientBigIntStr,
         secret: secretBigInt.toString(),
         nullifier: nullifierBigInt.toString(),
         amount: amountTinybars.toString(),
@@ -444,10 +452,11 @@ const submitProofToPoolTool = new DynamicStructuredTool({
     publicSignals: z.array(z.string()).describe('The ZK-SNARK public signals'),
     proofType: z.enum(['shield', 'withdraw']).describe('Type of proof'),
     amount: z.number().optional().describe('Amount being transferred (required for policy guard)'),
+    newCommitment: z.string().optional().describe('New commitment for internal swaps'),
     submitter: z.string().optional().describe('Account ID of the submitter'),
     stealthPayload: z.object({}).optional().describe('Optional metadata for stealth identification')
   }),
-  func: async ({ proof, publicSignals, proofType, amount, submitter, stealthPayload }) => {
+  func: async ({ proof, publicSignals, proofType, amount, newCommitment, submitter, stealthPayload }) => {
     try {
       const client = getClient();
       if (!client) throw new Error('Hedera credentials not configured');
@@ -463,6 +472,7 @@ const submitProofToPoolTool = new DynamicStructuredTool({
         proof,
         publicSignals,
         amount,
+        newCommitment,
         submitter,
         stealthPayload,
         timestamp: Date.now()

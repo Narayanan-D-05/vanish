@@ -148,6 +148,12 @@ class UserAgent {
     this.logger.setSessionContext(this.sessionContext); // Register the context with the logger
     // True request-scoped context for concurrent tabs
 
+    // Path for persisted session keys (survives restarts)
+    this.sessionsStatePath = path.join(__dirname, '..', '..', 'sessions_state.json');
+
+    // Restore any previously provisioned sessions so offline receivers keep working
+    this.loadPersistedSessions();
+
     // Start listening for completion notifications
     this.startListeningForCompletions();
 
@@ -376,6 +382,9 @@ If a user asks to withdraw to a public account, proactively warn them about chai
           secrets:         sessionSecrets,
           vaultPath
         });
+
+        // Persist session keys to disk so this receiver works offline on next restart
+        this.persistSessions();
         // this.activeSessionAddress = evmAddress.toLowerCase(); // DEPRECATED: Causes cross-tab leakage
 
         this.sessionContext.run(evmAddress.toLowerCase(), () => {
@@ -426,7 +435,13 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       res.json({
         success: true,
         session: session
-          ? { accountId: session.evmAddress, evmAddress: session.evmAddress, walletType: session.walletType, connectedAt: session.connectedAt }
+          ? {
+              accountId: session.evmAddress,
+              evmAddress: session.evmAddress,
+              hederaAccountId: session.hederaAccountId || null,
+              walletType: session.walletType,
+              connectedAt: session.connectedAt,
+            }
           : null,
         agentAccountId: this.accountId.toString()
       });
@@ -455,7 +470,10 @@ If a user asks to withdraw to a public account, proactively warn them about chai
           commitment: s.commitment,
           nullifier: s.nullifier,
           secret: '*****', // Mask actual secret
-          status: s.used ? 'spent' : 'shielded'
+          status: s.used ? 'spent' : 'shielded',
+          sender: s.sender || null,          // populated for recv_ (received) fragments
+          transactionId: s.transactionId || null,
+          receivedAt: s.receivedAt || null,
         }));
         res.json({ success: true, fragments });
       });
@@ -748,8 +766,11 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       return 0;
     }
 
-    // Get last sync timestamp from session or default to session start
-    const lastSyncTimestamp = session.lastSyncTimestamp || session.connectedAt || Date.now() - 86400000; // Default: 24 hours ago
+    // Get last sync timestamp from session.
+    // CRITICAL: If this is the first sync (no lastSyncTimestamp), ALWAYS go back
+    // 24 hours — NOT connectedAt — because the receiver may have been provisioned
+    // AFTER the sender did the transfer, meaning connectedAt > message timestamp.
+    const lastSyncTimestamp = session.lastSyncTimestamp || (Date.now() - 86400000);
     const lastSyncSeconds = Math.floor(lastSyncTimestamp / 1000);
 
     console.log(`🔄 Syncing offline messages for ${evmAddress.slice(0, 12)}...`);
@@ -760,11 +781,24 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       const axios = require('axios');
       const { decryptMessage } = require('../../lib/hip1334.cjs');
 
-      // Fetch messages from Mirror Node
-      const msgUrl = `${mirrorUrl}/api/v1/topics/${topicId}/messages?timestamp=gt:${lastSyncSeconds}`;
-      const response = await axios.get(msgUrl, { timeout: 15000 });
+      // Fetch ALL messages from Mirror Node with pagination.
+      // The Mirror Node caps results at 25 messages per page — without pagination,
+      // new messages at position 26+ are permanently missed!
+      const allMessages = [];
+      let nextUrl = `${mirrorUrl}/api/v1/topics/${topicId}/messages?timestamp=gt:${lastSyncSeconds}&limit=100&order=asc`;
 
-      const messages = response.data?.messages || [];
+      while (nextUrl) {
+        const response = await axios.get(nextUrl, { timeout: 15000 });
+        const page = response.data?.messages || [];
+        allMessages.push(...page);
+        // Mirror Node returns a "next" link when there are more pages
+        nextUrl = response.data?.links?.next
+          ? `${mirrorUrl}${response.data.links.next}`
+          : null;
+        if (page.length === 0) break; // safety exit
+      }
+
+      const messages = allMessages;
       if (messages.length === 0) {
         console.log(`   ✓ No new messages since last sync`);
         session.lastSyncTimestamp = Date.now();
@@ -804,12 +838,20 @@ If a user asks to withdraw to a public account, proactively warn them about chai
             processedCount++;
           } else if (payload.type === 'INTERNAL_SWAP' && payload.recipientAccountId === myHederaId) {
             console.log(`   💰 Processing internal swap: ${payload.amount} HBAR from ${payload.senderAccountId}`);
-            await this.handleIncomingTransfer(payload);
+            // Pass evmAddress as _evmOverride so handleIncomingTransfer explicitly
+            // targets the correct session vault — no AsyncLocalStorage needed.
+            await this.handleIncomingTransfer(payload, evmAddress.toLowerCase());
             processedCount++;
           } else if (payload.type === 'STEALTH_TRANSFER') {
-            // For stealth transfers, we process regardless since the
-            // handleStealthTransfer function does multi-tenant matching
-            await this.handleStealthTransfer(payload);
+            // Stealth transfers do multi-tenant matching inside handleStealthTransfer
+            await new Promise((resolve, reject) => {
+              this.sessionContext.run(evmAddress.toLowerCase(), async () => {
+                try {
+                  await this.handleStealthTransfer(payload);
+                  resolve();
+                } catch (e) { reject(e); }
+              });
+            });
             processedCount++;
           }
         } catch (err) {
@@ -849,6 +891,105 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       }
     }
     return total;
+  }
+
+  /**
+   * Persist session keys to disk so offline receivers survive User Agent restarts.
+   * Only saves the minimum data needed to decrypt incoming transfers:
+   * evmAddress, hederaAccountId, viewKey, spendKey, vaultKey, vaultPath.
+   * Does NOT save in-memory secrets (those live in the encrypted vault file).
+   */
+  persistSessions() {
+    try {
+      const entries = [];
+      for (const [addr, session] of this.sessions.entries()) {
+        entries.push({
+          evmAddress:          session.evmAddress,
+          hederaAccountId:     session.hederaAccountId,
+          walletType:          session.walletType,
+          vaultKey:            session.vaultKey,
+          spendKey:            session.spendKey,
+          viewKey:             session.viewKey,
+          vaultPath:           session.vaultPath,
+          lastSyncTimestamp:   session.lastSyncTimestamp || session.connectedAt || Date.now(),
+          persistedAt:         Date.now(),
+        });
+      }
+      require('fs').writeFileSync(this.sessionsStatePath, JSON.stringify(entries, null, 2));
+      console.log(`💾 [Sessions] Persisted ${entries.length} session(s) to disk`);
+    } catch (err) {
+      console.error(`⚠️ [Sessions] Failed to persist sessions: ${err.message}`);
+    }
+  }
+
+  /**
+   * Load persisted sessions from disk on startup.
+   * Restores viewKey / spendKey / vaultKey so the User Agent can decrypt
+   * incoming HCS transfers for receivers who are currently offline.
+   */
+  loadPersistedSessions() {
+    try {
+      if (!require('fs').existsSync(this.sessionsStatePath)) return;
+      const entries = JSON.parse(require('fs').readFileSync(this.sessionsStatePath, 'utf8'));
+      if (!Array.isArray(entries) || entries.length === 0) return;
+
+      let restored = 0;
+      for (const entry of entries) {
+        if (!entry.evmAddress || !entry.viewKey) continue;
+        const addr = entry.evmAddress.toLowerCase();
+
+        // Re-open the vault file (contains fragment secrets)
+        const sessionVault = new VaultWrapper(entry.vaultPath);
+        let sessionSecrets = new Map();
+        try {
+          const data = sessionVault.decrypt(entry.vaultKey);
+          for (const [k, v] of Object.entries(data)) sessionSecrets.set(k, v);
+        } catch { /* vault empty or not yet created */ }
+
+        this.sessions.set(addr, {
+          evmAddress:        entry.evmAddress,
+          hederaAccountId:   entry.hederaAccountId,
+          walletType:        entry.walletType || 'metamask',
+          connectedAt:       entry.persistedAt || Date.now(),
+          lastSyncTimestamp: entry.lastSyncTimestamp || entry.persistedAt || null,
+          vaultKey:          entry.vaultKey,
+          spendKey:          entry.spendKey,
+          viewKey:           entry.viewKey,
+          vault:             sessionVault,
+          secrets:           sessionSecrets,
+          vaultPath:         entry.vaultPath,
+        });
+        restored++;
+      }
+
+      if (restored > 0) {
+        console.log(`🔄 [Sessions] Restored ${restored} offline session(s) — receivers are active without re-provisioning`);
+        for (const [addr] of this.sessions.entries()) {
+          console.log(`   ✅ ${addr.slice(0, 12)}... ready to receive transfers`);
+        }
+
+        // ── OFFLINE CATCH-UP SYNC ────────────────────────────────────────────
+        // After sessions are loaded, run a background sync to pick up any
+        // INTERNAL_SWAP / STEALTH_TRANSFER messages that arrived while offline.
+        // Use setImmediate so the HTTP server boots first.
+        setImmediate(async () => {
+          try {
+            console.log(`\n📬 [Catch-Up Sync] Checking HIP-1334 inbox for missed transfers...`);
+            for (const [addr] of this.sessions.entries()) {
+              const count = await this.syncOfflineMessages(addr);
+              if (count > 0) {
+                console.log(`   ✅ [Catch-Up] ${addr.slice(0, 12)}... — ${count} transfer(s) added to vault`);
+              }
+            }
+          } catch (syncErr) {
+            console.warn(`⚠️ [Catch-Up Sync] Error: ${syncErr.message}`);
+          }
+        });
+        // ─────────────────────────────────────────────────────────────────────
+      }
+    } catch (err) {
+      console.error(`⚠️ [Sessions] Failed to load persisted sessions: ${err.message}`);
+    }
   }
 
   /**
@@ -1279,10 +1420,13 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         const derivedAddressFull = keccak256(Buffer.from(derivedPublicKey.slice(4), 'hex'));
         const derivedEvmAddress = '0x' + derivedAddressFull.slice(24, 64);
         
+        /*
         console.log(`   🔍 DEBUG: Expected stealth address: ${expectedStealthAddress}`);
         console.log(`   🔍 DEBUG: Derived EVM address: ${derivedEvmAddress}`);
         const matches = derivedEvmAddress.toLowerCase() === expectedStealthAddress.toLowerCase();
         console.log(`   🔍 DEBUG: Match: ${matches}`);
+        */
+        const matches = derivedEvmAddress.toLowerCase() === expectedStealthAddress.toLowerCase();
         
         if (!matches) {
           console.error(`   ⚠️  WARNING: Derived key does NOT match expected address!`);
@@ -1902,18 +2046,38 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   /**
    * Handle incoming internal transfer (Receiver functionality)
    */
-  async handleIncomingTransfer(payload) {
+  async handleIncomingTransfer(payload, _evmOverride = null) {
     const { newCommitment, newSecret, newNullifier, amount, senderAccountId, transactionId } = payload;
+
+    // Resolve EVM address: explicit override > AsyncLocalStorage context
+    const evmAddr = _evmOverride ||
+      (this.sessionContext && this.sessionContext.getStore()) ||
+      null;
+
+    const secrets = this.getSessionSecrets(evmAddr);
+
+    // Deduplication: skip if we already have this transfer (by transactionId or commitment)
+    if (transactionId && transactionId !== 'pending') {
+      for (const [, data] of secrets.entries()) {
+        if (data.transactionId === transactionId) return;
+      }
+    }
+    if (newCommitment) {
+      for (const [, data] of secrets.entries()) {
+        if (data.commitment === newCommitment) return;
+      }
+    }
 
     console.log('\n✨ INCOMING VANISH TRANSFER! ✨');
     console.log(`   From: ${senderAccountId}`);
     console.log(`   Amount: ${amount} HBAR`);
     console.log(`   Transaction: ${transactionId || 'pending'}`);
 
-    // Store the received commitment in vault
-    const transferId = `recv_${Date.now()}`;
-    const secrets = this.getSessionSecrets();
+    // Unique ID: timestamp + random suffix prevents collisions during rapid replay
+    const transferId = `recv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
     secrets.set(transferId, {
+      id: transferId,
       secret: newSecret,
       nullifier: newNullifier,
       commitment: newCommitment,
@@ -1924,22 +2088,25 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       used: false
     });
 
-    this.saveSessionSecrets();
+    // Explicit evmAddr so saveSessionSecrets never falls back to CLI vault
+    this.saveSessionSecrets(evmAddr);
 
     console.log(`   💾 Stored in vault as: ${transferId}`);
     console.log(`   💰 New shielded balance: ${this.getShieldedBalance()} HBAR\n`);
 
-    // Send acknowledgment back to sender
-    try {
-      await hip1334.sendEncryptedMessage(this.client, senderAccountId, {
-        type: 'INTERNAL_SWAP_ACK',
-        originalCommitment: newCommitment,
-        receivedAt: Date.now(),
-        status: 'CONFIRMED'
-      });
-      console.log(`   📤 Acknowledgment sent to sender`);
-    } catch (ackErr) {
-      // Silent fail - acknowledgment is optional
+    // Send ACK only on live transfers, not during offline replay
+    if (!_evmOverride) {
+      try {
+        await hip1334.sendEncryptedMessage(this.client, senderAccountId, {
+          type: 'INTERNAL_SWAP_ACK',
+          originalCommitment: newCommitment,
+          receivedAt: Date.now(),
+          status: 'CONFIRMED'
+        });
+        console.log(`   📤 Acknowledgment sent to sender`);
+      } catch (ackErr) {
+        // Silent fail - ACK is optional
+      }
     }
   }
 
@@ -2037,7 +2204,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
         case 'shields':
         case 'vault':
-          return this.listUserShieldedFunds();
+          return this.listUserShieldedFunds(evmAddress);
 
         case 'claim':
           // Manual claim of pending stealth transfers
@@ -2301,9 +2468,14 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    * List user's shielded funds (unspent fragments in pool)
    * Reads from live userSecrets Map (not cached blindedVault)
    */
-   listUserShieldedFunds() {
+   listUserShieldedFunds(evmAddress = null) {
     // Read from the correct session's secrets Map
-    const secrets = this.getSessionSecrets();
+    const secrets = this.getSessionSecrets(evmAddress);
+    // Get the display account ID from the session (not the agent's own accountId)
+    const sessionAddr = evmAddress || (this.sessionContext && this.sessionContext.getStore());
+    const sessionHederaId = sessionAddr
+      ? (this.sessions.get(sessionAddr.toLowerCase())?.hederaAccountId?.toString() || this.accountId.toString())
+      : this.accountId.toString();
     const unspent = [];
     const pendingStealth = [];
 
@@ -2328,8 +2500,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
     if (unspent.length === 0 && pendingStealth.length === 0) {
       output += `   No unspent shielded funds.\n`;
-      output += `   Account: ${this.accountId}\n`;
-      output += `   Vault: ${path.basename(this.secretsPath)}\n`;
+      output += `   Account: ${sessionHederaId}\n`;
       output += `   Use 'shield' or 'ai-shield' to deposit.`;
       return output;
     }
@@ -2347,8 +2518,9 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
     if (receivedTransfers.length > 0) {
       output += `\n   📥 Received Transfers:\n`;
+      const sessionSecrets = this.getSessionSecrets();
       receivedTransfers.forEach(f => {
-        const data = this.userSecrets.get(f.id);
+        const data = sessionSecrets.get(f.id);
         const from = data?.sender ? ` from ${data.sender}` : '';
         output += `      • ${f.id}: ${f.amount} HBAR${from}\n`;
       });
@@ -2600,7 +2772,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    * Secure subset sum helper - finds exact match for target amount
    */
   findExactSubset(target, available) {
-    console.log(`🔍 [DEBUG] Target: ${target} HBAR, Available: ${available.length} fragments`);
+    // console.log(`🔍 [DEBUG] Target: ${target} HBAR, Available: ${available.length} fragments`);
 
     // Filter to valid items with positive amounts
     const validItems = available.filter(item => item.amount > 0);
@@ -2886,7 +3058,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       // Generate NEW secret for the recipient (In a real app, you'd use their public key)
       const newSecret = '0x' + crypto.randomBytes(32).toString('hex');
       const newNullifier = '0x' + crypto.randomBytes(32).toString('hex');
-      const newCommitment = '0x' + crypto.randomBytes(32).toString('hex'); // Mocked Poseidon for internal swap leaf
+      const newCommitment = '0x' + crypto.randomBytes(32).toString('hex'); // Unique commitment for internal swap leaf
 
       // Generate proof with recipient 0x0...0
       const res = await this.generateInternalSwapPayload(recipientAccountId, frag.amount, frag.id, newCommitment, { newSecret, newNullifier }, evmAddress);
@@ -4119,8 +4291,10 @@ Be concise, technical, and privacy-focused in your responses.`;
     });
     
     this.rl.on('close', () => {
-      console.log('\n👋 User Agent session ended.');
-      process.exit(0);
+      console.log('\n👋 CLI closed — HTTP server and all wallet sessions remain active.');
+      console.log('   (Re-attach via the UI or restart the terminal to get the CLI back)\n');
+      // Do NOT call process.exit() here — the HTTP server must keep running
+      // so offline receivers and the frontend can still communicate with the agent.
     });
   }
 }
