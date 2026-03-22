@@ -1,0 +1,141 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Inter', sans-serif;
+  }
+
+  body {
+    background-color: #131315;
+    color: #e5e1e4;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  /* Custom Scrollbar */
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0e0e10;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2a2a2c;
+    border-radius: 0px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #8aebff;
+  }
+
+  ::selection {
+    background: rgba(138, 235, 255, 0.3);
+    color: #8aebff;
+  }
+}
+
+@layer components {
+  /* Glass Panel */
+  .glass-panel {
+    background: rgba(14, 14, 16, 0.8);
+    backdrop-filter: blur(24px);
+    border: 1px solid rgba(138, 235, 255, 0.1);
+  }
+
+  /* Subtle Glass Panel for vault */
+  .glass-panel-subtle {
+    background: rgba(29, 27, 29, 0.6);
+    backdrop-filter: blur(12px);
+  }
+
+  /* Terminal glow text */
+  .terminal-glow {
+    text-shadow: 0 0 8px rgba(138, 235, 255, 0.4);
+  }
+
+  /* Cursor blink */
+  .cursor-blink {
+    display: inline-block;
+    width: 8px;
+    height: 18px;
+    background-color: #8aebff;
+    animation: blink 1s step-end infinite;
+    vertical-align: middle;
+    margin-left: 4px;
+  }
+
+  /* Noise overlay texture */
+  .noise-overlay {
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+    opacity: 0.04;
+    pointer-events: none;
+  }
+
+  /* Scanline decoration */
+  .scanline {
+    width: 100%;
+    height: 2px;
+    background: linear-gradient(to right, transparent, #8aebff, transparent);
+    opacity: 0.2;
+    position: absolute;
+    left: 0;
+  }
+
+  /* Active sidebar nav item */
+  .sidebar-active {
+    @apply bg-cyan-400/10 text-cyan-400 border-r-2 border-cyan-400;
+  }
+
+  .sidebar-inactive {
+    @apply text-zinc-600 hover:text-zinc-400 hover:bg-zinc-900/50;
+  }
+}
+
+@layer utilities {
+  /* Typography utilities */
+  .font-headline {
+    font-family: 'Space Grotesk', sans-serif;
+  }
+  .font-body {
+    font-family: 'Inter', sans-serif;
+  }
+  .font-label {
+    font-family: 'Space Grotesk', sans-serif;
+  }
+  .font-mono-tech {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* Keyframe animations */
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); opacity: 0.5; }
+  50% { transform: scale(1); opacity: 1; }
+  100% { transform: scale(0.95); opacity: 0.5; }
+}
+
+@keyframes scanline-move {
+  0% { top: -2px; }
+  100% { top: 100%; }
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.animate-scanline-move {
+  animation: scanline-move 6s linear infinite;
+}

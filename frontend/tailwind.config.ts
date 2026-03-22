@@ -1,0 +1,92 @@
+import type { Config } from "tailwindcss";
+
+const config: Config = {
+  content: [
+    "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        // Reference design color tokens
+        "on-tertiary-fixed": "#00201c",
+        "on-primary-fixed-variant": "#004e5a",
+        "surface-bright": "#39393b",
+        "primary-container": "#22d3ee",
+        "on-surface-variant": "#bbc9cd",
+        "primary": "#8aebff",
+        "on-secondary-fixed-variant": "#46464e",
+        "on-tertiary-fixed-variant": "#005047",
+        "on-secondary": "#2f3038",
+        "inverse-surface": "#e5e1e4",
+        "on-surface": "#e5e1e4",
+        "surface-variant": "#353437",
+        "on-primary-fixed": "#001f25",
+        "surface-container-highest": "#353437",
+        "tertiary-container": "#32d7c2",
+        "on-error": "#690005",
+        "outline": "#859397",
+        "surface-container-lowest": "#0e0e10",
+        "tertiary": "#5bf4de",
+        "secondary-container": "#4a4b53",
+        "error-container": "#93000a",
+        "surface-dim": "#131315",
+        "surface-container-high": "#2a2a2c",
+        "surface-container": "#201f22",
+        "secondary-fixed": "#e3e1ec",
+        "primary-fixed": "#a2eeff",
+        "secondary-fixed-dim": "#c6c5cf",
+        "tertiary-fixed": "#62fae3",
+        "outline-variant": "#3c494c",
+        "on-primary": "#00363e",
+        "on-background": "#e5e1e4",
+        "background": "#131315",
+        "surface": "#131315",
+        "secondary": "#c6c5cf",
+        "on-primary-container": "#005763",
+        "inverse-primary": "#006877",
+        "on-error-container": "#ffdad6",
+        "surface-tint": "#2fd9f4",
+        "on-secondary-container": "#bcbbc5",
+        "inverse-on-surface": "#313032",
+        "tertiary-fixed-dim": "#3cddc7",
+        "surface-container-low": "#1c1b1d",
+        "on-secondary-fixed": "#1a1b22",
+        "error": "#ffb4ab",
+        "primary-fixed-dim": "#2fd9f4",
+        "on-tertiary-container": "#00594f",
+        "on-tertiary": "#003731",
+      },
+      fontFamily: {
+        "headline": ["Space Grotesk", "sans-serif"],
+        "body": ["Inter", "sans-serif"],
+        "label": ["Space Grotesk", "sans-serif"],
+        "mono-tech": ["JetBrains Mono", "monospace"],
+      },
+      borderRadius: {
+        DEFAULT: "0.125rem",
+        lg: "0.25rem",
+        xl: "0.5rem",
+        full: "0.75rem",
+      },
+      animation: {
+        "pulse-ring": "pulse-ring 3s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+        "cursor-blink": "blink 1s step-end infinite",
+      },
+      keyframes: {
+        "pulse-ring": {
+          "0%": { transform: "scale(0.95)", opacity: "0.5" },
+          "50%": { transform: "scale(1)", opacity: "1" },
+          "100%": { transform: "scale(0.95)", opacity: "0.5" },
+        },
+        blink: {
+          "50%": { opacity: "0" },
+        },
+      },
+    },
+  },
+  plugins: [],
+};
+
+export default config;
