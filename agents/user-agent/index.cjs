@@ -741,6 +741,16 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   }
 
   /**
+   * ─── AGENTIC PIVOT: ASYNCHRONOUS STATE RECONSTRUCTION (THE GHOST SYNC) ───────────
+   * Autonomous agents do not require continuous human supervision. If the user's 
+   * laptop is closed and the User Agent goes offline, it doesn't "break." Upon 
+   * booting up, the Agent autonomously queries the Hedera Mirror Node REST API. It 
+   * identifies missed HCS-10 network events, decrypts historical payloads using its 
+   * local view keys, and seamlessly reconstructs the user's Zero-Knowledge vault 
+   * state. It ensures absolute data continuity without the user ever needing to 
+   * click a "sync" button.
+   * ─────────────────────────────────────────────────────────────────────────────────
+   * 
    * Sync offline messages from Mirror Node (Catch-Up Sync)
    * Fetches HCS messages missed while the agent was offline and processes them.
    * @param {string} evmAddress - The EVM address for the session to sync
@@ -2169,6 +2179,16 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   }
 
   /**
+   * ─── AGENTIC PIVOT: SEMANTIC INTENT EXECUTION (THE CRYPTOGRAPHIC TRANSLATOR) ─────
+   * In traditional DeFi, a user must manually approve allowances, generate proofs, 
+   * and sign multiple transactions. With Vanish, the user simply states an objective 
+   * in natural language (e.g., "Pay Alice 50 HBAR without doxxing my treasury"). 
+   * The Agent autonomously reasons the optimal cryptographic path: it provisions a 
+   * Just-In-Time (JIT) HIP-1340 allowance, fragments the HBAR, derives Alice’s 
+   * X25519 stealth key, generates the local ZK-proofs, and executes the transfer. 
+   * The user delegates the goal, and the Agent orchestrates the math.
+   * ─────────────────────────────────────────────────────────────────────────────────
+   * 
    * Parse and execute direct commands (no AI needed)
    * @param {string} input Natural language or CLI command
    * @param {string} evmAddress User's MetaMask address
@@ -3115,6 +3135,17 @@ If a user asks to withdraw to a public account, proactively warn them about chai
 
     this.logger.logic(`✅ ZK Proof synthesized successfully. Commitment: ${newCommitment.substring(0, 16)}...`);
 
+    // ─── AGENTIC PIVOT: PROACTIVE HEURISTIC DEFENSE (THE "WASH CYCLE" ADVISOR) ──────
+    // A dumb wallet will blindly let a user withdraw shielded funds directly to a 
+    // centralized exchange, instantly linking their identity via "mixer taint." The 
+    // Vanish User Agent actively monitors for operational security failures. If a 
+    // user requests a risky public withdrawal, the Agent intervenes and suggests a 
+    // "Wash Cycle" instead. It autonomously proposes routing the funds through 
+    // mathematically derived stealth addresses, applying randomized temporal delays, 
+    // and splitting the withdrawal into randomized chunks to completely break volume 
+    // and timing correlations before the funds hit the main wallet.
+    // ─────────────────────────────────────────────────────────────────────────────────
+    //
     // 2. Submit to Pool Manager with newCommitment
     this.logger.decision(`🚀 Broadcasting ZK-Proof & Stealth Payload via HIP-1334 (Target: ${recipientAccountId})`);
     const submitTool = tools.find(t => t.name === 'submit_proof_to_pool');
@@ -3586,7 +3617,16 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   }
   
   /**
-   * AI-Powered Smart Shield
+   * ─── AGENTIC PIVOT: CRYPTOGRAPHIC DENOMINATION ROUTING (AUTO-FRAGMENTATION) ──────
+   * Privacy pools only work if deposits blend in. If a user tries to shield an 
+   * obscure amount like 137.42 HBAR, they become easily trackable. The User Agent 
+   * autonomously analyzes the Pool Manager's current liquidity density. It reasons 
+   * that the safest anonymity sets are in standard denominations (e.g., 10, 50, and 
+   * 100 HBAR notes). It seamlessly auto-fragments the user's 137.42 deposit into 
+   * [100, 10, 10, 10, 7.42], automatically optimizing the user's camouflage without 
+   * requiring manual input.
+   * ─────────────────────────────────────────────────────────────────────────────────
+   * 
    * Uses Ollama to reason about the best fragmentation strategy
    */
   async aiShieldFunds(amount, evmAddress = null) {
