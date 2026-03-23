@@ -3591,12 +3591,16 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    */
   async aiShieldFunds(amount, evmAddress = null) {
     this.logger.logic(`AI-Powered Smart Shield: ${amount} HBAR`, { amount });
-    console.log(`\n🧠 AI-Powered Smart Shield: ${amount} HBAR\n`);
-    console.log('💭 Agent is thinking about optimal strategy...\n');
-    console.log('━'.repeat(60) + '\n');
+    if (process.env.ENABLE_DEBUG === 'true') {
+      console.log(`\n🧠 AI-Powered Smart Shield: ${amount} HBAR\n`);
+      console.log('💭 Agent is thinking about optimal strategy...\n');
+      console.log('━'.repeat(60) + '\n');
+    }
 
     // [THOUGHT] Agent initiates reasoning with REAL NETWORK STATE
-    console.log('🌐 Fetching real-time network state (Pool Anonymity Set, Gas)...');
+    if (process.env.ENABLE_DEBUG === 'true') {
+      console.log('🌐 Fetching real-time network state (Pool Anonymity Set, Gas)...');
+    }
     const statusResult = await this.queryPoolStatus();
     const isSuccess = !statusResult.startsWith('❌');
     
@@ -3788,7 +3792,9 @@ If a user asks to withdraw to a public account, proactively warn them about chai
    * AI-Powered Fragmentation Plan (Preview)
    */  
   async aiFragmentationPlan(amount) {
-    console.log(`\n🧠 AI analyzing fragmentation strategy for ${amount} HBAR...\n`);
+    if (process.env.ENABLE_DEBUG === 'true') {
+      console.log(`\n🧠 AI analyzing fragmentation strategy for ${amount} HBAR...\n`);
+    }
     
     try {
       const plan = await aiFragmentor.analyzeFragmentationStrategy(amount);
