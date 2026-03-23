@@ -1431,6 +1431,7 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         if (!matches) {
           console.error(`   ⚠️  WARNING: Derived key does NOT match expected address!`);
           console.error(`   ⚠️  The stealth transfer may not be claimable with this key.`);
+          return null;
         }
       }
 
