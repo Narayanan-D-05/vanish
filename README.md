@@ -1,484 +1,187 @@
-# Vanish 🛡️
+# Vanish: Double-Blind AI Privacy Layer for Hedera
 
-> **The Double-Blind AI Privacy Layer for Hedera** — A Confidential AI Agent that shields wallet balances and transaction history using HIP-1340, HTS, HCS, and Stealth Addresses.
+**Vanish** is a production-grade, AI-driven privacy protocol built natively on the Hedera network. It operates as a "Double-Blind" system where **Local AI Agents** (Provers) interface with a **Global Guardian Agent** (Verifier) to provide anonymous fund transfers, stealth addresses, and zero-knowledge shielded pools—all while enforcing autonomous Anti-Money Laundering (AML) compliance heuristics.
 
-[![Hedera](https://img.shields.io/badge/Hedera-Testnet-blueviolet)](https://hedera.com)
-[![Track](https://img.shields.io/badge/Track-AI%20%26%20Agents-green)](https://hedera.com)
-[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
+This project merges **Next.js UI paradigms**, **Zero-Knowledge Cryptography (Groth16/Circom)**, **LangChain/Ollama autonomous agents**, and **Hedera's Consensus Service (HCS) / Smart Contract Service (HSCS)** into a unified, agentic architecture.
 
 ---
 
-## 🎯 Problem Statement
+## 🏗️ Architecture Flow
 
-Enterprise users face a critical dilemma: blockchain transparency is great for trust but terrible for privacy. Your wallet balance, transaction history, and business relationships are **permanently visible** to anyone who looks.
+```mermaid
+graph TD
+    classDef frontend fill:#1f2937,stroke:#3b82f6,stroke-width:2px,color:#fff;
+    classDef agent fill:#065f46,stroke:#10b981,stroke-width:2px,color:#fff;
+    classDef verifier fill:#b45309,stroke:#f59e0b,stroke-width:2px,color:#fff;
+    classDef onchain fill:#4c1d95,stroke:#8b5cf6,stroke-width:2px,color:#fff;
 
-**Vanish solves this** by deploying autonomous AI agents that act as non-custodial proxies, breaking the on-chain "relation tree" while maintaining full regulatory compliance.
-
----
-
-## 🔄 The "Vanish" Workflow
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              VANISH WORKFLOW                                    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-    ┌──────────┐         ┌──────────────┐         ┌───────────────┐
-    │  SENDER  │         │  POOL-AGENT  │         │   RECEIVER    │
-    │  VAULT   │         │  (Verifier)  │         │    VAULT      │
-    └────┬─────┘         └──────┬───────┘         └───────┬───────┘
-         │                      │                         │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 1: SHIELDING (HIP-1340 Delegation)│    │
-         │  └────────────────────────────────────────┘    │
-         │                      │                         │
-         ├──────────────────────►                         │
-         │   Delegate spending  │                         │
-         │   rights to Agent    │                         │
-         │                      │                         │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 2: BALANCE FRAGMENTATION          │    │
-         │  └────────────────────────────────────────┘    │
-         │                      │                         │
-         │   ┌─────────────────────────────┐              │
-         │   │  Worker Account 1: 100 HBAR │              │
-         │   │  Worker Account 2: 100 HBAR │              │
-         │   │  Worker Account 3: 100 HBAR │              │
-         │   │  ...                        │              │
-         │   │  Worker Account N: 100 HBAR │              │
-         │   └─────────────────────────────┘              │
-         │                      │                         │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 3: AGENTIC MIX (HTS Swap)         │    │
-         │  └────────────────────────────────────────┘    │
-         │                      │                         │
-         │                      │  HBAR → Shielded Token  │
-         │                      │  (Breaks direct link)   │
-         │                      │                         │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 4: zk-SNARK COMMITMENT            │    │
-         │  └────────────────────────────────────────┘    │
-         │                      │                         │
-         │                ┌─────┴─────┐                   │
-         │                │  MERKLE   │                   │
-         │                │   TREE    │                   │
-         │                │ (Secrets) │                   │
-         │                └─────┬─────┘                   │
-         │                      │                         │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 5: STEALTH ADDRESS GENERATION     │    │
-         │  └────────────────────────────────────────┘    │
-         │                      │                         │
-         │           Dual-Key Stealth Address             │
-         │           (One-time "ghost" account)           │
-         │                      │                         │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 6: BLIND TRANSFER                 │    │
-         │  └────────────────────────────────────────┘    │
-         │                      │                         │
-         │                      ├─────────────────────────►
-         │                      │   Funds → Stealth Addr  │
-         │                      │                         │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 7: SELECTIVE DISCLOSURE (HCS)     │    │
-         │  └────────────────────────────────────────┘    │
-         │                      │                         │
-         │              ┌───────┴───────┐                 │
-         │              │  Private HCS  │                 │
-         │              │    Topic      │─────────────────►
-         │              │  (Encrypted   │  Encrypted      │
-         │              │   Receipt)    │  Proof          │
-         │              └───────────────┘                 │
-         │                                                │
-         │  ┌────────────────────────────────────────┐    │
-         │  │ STEP 8: RECEIVER SCANS & CLAIMS        │    │
-         │  └────────────────────────────────────────┘    │
-         │                                                │
-         │                                    ┌───────────┤
-         │                                    │  Viewing  │
-         │                                    │    Key    │
-         │                                    │   Scan    │
-         │                                    └───────────┤
-         │                                                │
-    ┌────┴─────┐                              ┌───────────┴───┐
-    │  SENDER  │                              │   RECEIVER    │
-    │  (Done)  │                              │  (Funds Recv) │
-    └──────────┘                              └───────────────┘
+    F((Users / DAOs / Agents)):::frontend -->|Connect Wallet| UI[Next.js Dashboard]:::frontend
+    
+    UI -->|SSE Stream / Session Registration| UA[Local User Agent <br> LangChain + Ollama]:::agent
+    
+    UA -->|Generates ZK Proofs| ZK[Circom / snarkjs]:::agent
+    UA -->|Encrypted HCS Proofs <br> HIP-1334 Inbox| PM[Pool Manager <br> Verifier Agent]:::verifier
+    
+    PM -->|AML Check| CA[Chainalysis Oracle]:::verifier
+    PM -->|Policy Grouping & Delay| PE[Policy Engine]:::verifier
+    
+    PM -->|Signs AI Audit Envelope| HCS[HCS Audit Log]:::onchain
+    PM -->|Submits Root / Batch| SC[VanishGuard.sol]:::onchain
+    
+    SC -->|Verifies Proof & ECDSA Sig| HBAR[Anonymity Pool <br> HBAR Settlement]:::onchain
+    
+    DAOs[External HOL Agents]:::frontend -->|Discovers Agent over HCS-10| PM
 ```
 
 ---
 
-## 🧠 Knowledge Matrix: Who Knows What?
+## 📡 Sequence Diagram: Shield & Withdraw
 
-| Entity | Sender Identity | Receiver Identity | Amount | Transaction Link |
-|--------|-----------------|-------------------|--------|------------------|
-| **Public Observer** | ❌ Hidden | ❌ Hidden | ❌ Hidden | ❌ Broken |
-| **Pool-Manager Agent** | ❌ Hidden | ❌ Hidden | ✅ Knows | ❌ Broken |
-| **Sender** | ✅ Self | ✅ Knows | ✅ Knows | ✅ Knows |
-| **Receiver** | ❌ Hidden* | ✅ Self | ✅ Knows | ❌ Broken |
-| **Auditor (with View Key)** | ✅ Disclosed | ✅ Disclosed | ✅ Disclosed | ✅ Reconstructed |
-
-*\*Unless sender opts-in to Selective Disclosure*
-
----
-
-## 🏗️ System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              SYSTEM ARCHITECTURE                                │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                                  CLIENT LAYER                                   │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                 │
-│  │   User-Agent    │  │  Pool-Manager   │  │ Receiver-Agent  │                 │
-│  │   (Prover)      │  │   (Verifier)    │  │ (Stealth Watch) │                 │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘                 │
-│           │                    │                    │                          │
-└───────────┼────────────────────┼────────────────────┼───────────────────────────┘
-            │                    │                    │
-┌───────────┼────────────────────┼────────────────────┼───────────────────────────┐
-│           │           AGENT CORE LAYER              │                          │
-├───────────┼────────────────────┼────────────────────┼───────────────────────────┤
-│  ┌────────▼────────────────────▼────────────────────▼────────┐                 │
-│  │                    AI INFERENCE ENGINE                    │                 │
-│  │            (Decision Making & Coordination)               │                 │
-│  └────────┬─────────────────────────────────────────┬────────┘                 │
-│           │                                         │                          │
-│  ┌────────▼────────┐                       ┌────────▼────────┐                 │
-│  │  ZK-SNARK       │                       │  Stealth Addr   │                 │
-│  │  Circuit        │                       │  Generator      │                 │
-│  │  (Circom)       │                       │  (ERC-5564)     │                 │
-│  └─────────────────┘                       └─────────────────┘                 │
-│                                                                                │
-└────────────────────────────────────────────────────────────────────────────────┘
-                                      │
-┌─────────────────────────────────────┼──────────────────────────────────────────┐
-│                         HEDERA INTEGRATION LAYER                               │
-├─────────────────────────────────────┼──────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐ │ ┌──────────────┐  ┌──────────────┐       │
-│  │   HIP-1340   │  │     HTS      │ │ │     HCS      │  │   Mirror     │       │
-│  │  Delegation  │  │   (Swaps)    │ │ │  (Messages)  │  │    Node      │       │
-│  └──────┬───────┘  └──────┬───────┘ │ └──────┬───────┘  └──────┬───────┘       │
-│         │                 │         │        │                 │               │
-└─────────┼─────────────────┼─────────┼────────┼─────────────────┼───────────────┘
-          │                 │         │        │                 │
-┌─────────▼─────────────────▼─────────▼────────▼─────────────────▼───────────────┐
-│                           HEDERA NETWORK (Testnet/Mainnet)                     │
-│  ┌───────────────────────────────────────────────────────────────────────────┐ │
-│  │                         Consensus & State                                 │ │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │ │
-│  │  │   Merkle    │  │  Account    │  │   Token     │  │   Topic     │       │ │
-│  │  │   Tree      │  │  Balances   │  │  Registry   │  │  Messages   │       │ │
-│  │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘       │ │
-│  └───────────────────────────────────────────────────────────────────────────┘ │
-└────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant User as Next.js Dashboard
+    participant UA as Local User Agent
+    participant PM as Pool Manager (Verifier)
+    participant SC as VanishGuard (Smart Contract)
+    
+    %% Shielding Phase
+    rect rgb(30, 41, 59)
+    note right of User: Phase 1: Shielding Deposit
+    User->>UA: "Shield 50 HBAR" (Natural Language / Button)
+    UA->>UA: Generate secret & nullifier
+    UA->>UA: Compute Commitment = Poseidon(nullifier, secret, 50)
+    UA->>UA: Generate Groth16 ZK-SNARK Proof locally (snarkjs)
+    UA->>PM: Send Encrypted HIP-1334 Proof (to PM's HCS Inbox)
+    PM->>PM: Verify Groth16 Proof (Math Check)
+    PM->>PM: Chainalysis AML Heuristic Check
+    PM->>PM: Wait for diverse liquidity (Privacy Entropy)
+    PM->>SC: submitBatchWithDecision(Batch, Proofs, AI ECDSA Sig)
+    SC->>SC: Verify Proofs & AI Signature on-chain
+    SC->>SC: Update Merkle Tree Root
+    SC-->>PM: Tx Success (Event Emitted)
+    end
+    
+    %% Withdrawal Phase
+    rect rgb(15, 23, 42)
+    note right of User: Phase 2: Anonymous Withdrawal
+    User->>UA: "Withdraw 50 HBAR to 0.0.xyz"
+    UA->>UA: Fetch current Merkle Root (Ghost Sync)
+    UA->>UA: Generate Groth16 Withdrawal Proof
+    UA->>PM: Encrypted HIP-1334 Proof Transmit
+    PM->>PM: Verify Integrity & Policy Guard
+    PM->>SC: contract.withdraw(Nullifier Base, Recipient, Proof)
+    SC->>SC: Verify Proof matches Merkle Root
+    SC-->>User: 50 HBAR lands in 0.0.xyz anonymously
+    end
 ```
 
 ---
 
-## 🛠️ Technical Stack (2026)
+## 🌍 Live Testnet Deployments (Vanish 2026.1)
 
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| **Delegation** | HIP-1340 (EOA Code Delegation) | Non-custodial agent authorization |
-| **Token Swaps** | Hedera Token Service (HTS) | HBAR ↔ Shielded Token conversion |
-| **Messaging** | Hedera Consensus Service (HCS) | Encrypted receipts & proofs |
-| **Stealth Addresses** | ERC-5564 (Dual-Key) | One-time "ghost" accounts |
-| **Zero-Knowledge** | Circom + SnarkJS | zk-SNARK proof generation |
-| **Agent Framework** | Node.js + Hedera SDK | Autonomous agent orchestration |
-| **Mirror Node** | Hedera Mirror Node API | Transaction scanning & indexing |
+If you are connecting natively to the Hedera Testnet, the following endpoints are currently active for the Vanish network.
 
----
+| Component | Identifier / Account ID |
+| :--- | :--- |
+| **VanishGuard Smart Contract** | `0.0.8277357` |
+| **Pool Manager Account** | `0.0.8274009` |
+| **HIP-1334 Proof Inbox** | `0.0.8210357` |
+| **Private Data Topic** | `0.0.8119062` |
+| **Public Announcement Topic** | `0.0.8119063` |
 
-## 📦 Project Structure
+### 🤖 Hashgraph Online (HOL) Registry Endpoints
+Other agents and DAOs can dynamically look up Vanish Concierge services via HCS-10 on the testnet:
 
-```
-vanish/
-├── agents/
-│   ├── user-agent/           # Prover/Sender agent
-│   │   ├── index.js
-│   │   ├── fragmentor.js     # Balance fragmentation logic
-│   │   └── prover.js         # zk-SNARK proof generation
-│   ├── pool-manager/         # Verifier agent
-│   │   ├── index.js
-│   │   └── verifier.js       # Proof verification
-│   └── receiver-agent/       # Stealth watcher
-│       ├── index.js
-│       └── scanner.js        # Viewing key scanner
-├── circuits/
-│   ├── shield.circom         # Shielding circuit
-│   └── withdraw.circom       # Withdrawal circuit
-├── contracts/
-│   └── MerkleTree.sol        # Commitment tree
-├── lib/
-│   ├── stealth.js            # ERC-5564 implementation
-│   ├── hcs-private.js        # Encrypted HCS messaging
-│   └── delegation.js         # HIP-1340 helpers
-├── config/
-│   └── .env.example
-├── package.json
-└── README.md
-```
+**Vanish Pool Manager (AI Verifier):**
+- HOL Agent Account: `0.0.8309522`
+- Inbound Topic: `0.0.8309524`
+- Outbound Topic: `0.0.8309523`
+- Profile Topic: `0.0.8309528`
+
+**Vanish Agentic Pool (Proxy):**
+- HOL Agent Account: `0.0.8330708`
+- Inbound Topic: `0.0.8330713`
+- Outbound Topic: `0.0.8330711`
+- Profile Topic: `0.0.8330728`
 
 ---
 
-## 🚀 Quick Start
+## 🔐 Cryptography Deep Dive
+
+### 1. ZK-Shielding (Nullifiers & Commitments)
+- A deposit creates a `commitment = Poseidon(nullifier, secret, amount)`.
+- Re-spending requires calculating the `nullifierHash = Poseidon(nullifier)` and generating a SNARK proving knowledge of the private inputs that match a public commitment in the on-chain Merkle root.
+- The `shield.circom` and `withdraw.circom` circuits use **Poseidon Hashing** for leaf generation (reducing gas costs massively) while utilizing **SHA-256** for internal Merkle proof nodes to maintain compatibility with Hedera's EVM precompiles.
+
+### 2. Stealth Addresses (secp256k1 Homomorphic Derivation)
+To execute anonymous, direct internal pool transfers without leaking linkability:
+1. User Agent generates an ephemeral X25519 keypair.
+2. Computes a shared secret via ECDH against the recipient's public View Key.
+3. The shared secret is hashed into a scalar offset.
+4. Using homomorphic derivation: `stealthPrivate = (spendPrivate + offset) mod n`.
+5. The funds are sent to the resulting public key, and an encrypted HCS message alerts the recipient to derive the offset and claim.
+
+---
+
+## ⚙️ Getting Started & Testing
 
 ### Prerequisites
+- Node.js 18+
+- Hardhat (`npm i -g hardhat`)
+- Circom 2.x (For circuit compiling)
+- Ollama (Optional: For Llama 3.1 AI decision capabilities)
 
-- Node.js v18+
-- npm or yarn
-- Hedera Testnet Account ([Portal](https://portal.hedera.com))
+### General Setup
+1. Clone the repository and install root dependencies:
+   ```bash
+   npm install --legacy-peer-deps
+   ```
+2. Setup the `.env` file based on `.env.example`.
 
-### Installation
+### Compiling Smart Contracts & Circuits
+```bash
+npm run compile
+npm run compile:circuits
+npm run deploy:contract
+```
+
+### 🧪 Running Tests
+Vanish includes comprehensive testing suites for the agents and ZK components.
 
 ```bash
-# Clone the repository
-git clone https://github.com/Narayanan-D-05/vanish
-cd vanish
+# 1. Test Prover/Verifier protocol loop (Shield & Withdraw paths)
+npm run test:agents
 
-# Install dependencies
-npm install
+# 2. Test the mathematical logic underlying ZK fragmentation
+npm run test:fragmentation
 
-# Install Circom (for zk-SNARKs)
-npm install -g circom snarkjs
+# 3. Test Agentic AI intent mapping vs Rules Enging
+npm run test:ai
 
-# Copy environment template
-cp config/.env.example .env
+# 4. Under-load testing for ZK-proof generation overhead on Node.js
+npm run test:performance
 ```
 
-### Configuration
-
-Edit `.env` with your Hedera credentials:
-
-```env
-# Hedera Testnet Credentials
-HEDERA_ACCOUNT_ID=0.0.XXXXXX
-HEDERA_PRIVATE_KEY=302e020100300506...
-
-# Agent Configuration
-NUM_WORKER_ACCOUNTS=50
-FRAGMENTATION_AMOUNT=100
-
-# HCS Topics
-PRIVATE_TOPIC_ID=0.0.XXXXXX
-```
-
-### Running the Agents
-
+### Starting the Agentic Infrastructure
+You can run the full local network via concurrently:
 ```bash
-# Terminal 1: Start Pool-Manager (Verifier)
-npm run start:pool
-
-# Terminal 2: Start User-Agent (Prover/Sender)
-npm run start:user
-
-# Terminal 3: Start Receiver-Agent (Stealth Watcher)
-npm run start:receiver
+npm run start:all
 ```
+*Alternatively, start components individually:*
+- Pool Manager: `npm run start:pool`
+- User Agent: `npm run start:user`
+- AI-Mode User Agent: `npm run start:user:ai`
+
+### Starting the Frontend UI
+Open a new terminal session, navigate to the `frontend` folder:
+```bash
+cd frontend
+npm install --legacy-peer-deps
+npm run dev
+```
+Navigate to `http://localhost:3000` to access the Vanish UI Dashboard.
 
 ---
 
-## 💻 Implementation Examples
-
-### Balance Fragmentation
-
-```javascript
-// agents/user-agent/fragmentor.js
-async function fragmentBalance(primaryAccount, amount, numWorkers) {
-  const workers = [];
-  const fragmentSize = amount / numWorkers;
-  
-  for (let i = 0; i < numWorkers; i++) {
-    // Create worker account using Hedera SDK
-    const workerAccount = await createWorkerAccount();
-    
-    // Transfer fragment to worker
-    await transferHBAR(primaryAccount, workerAccount, fragmentSize);
-    
-    workers.push({
-      accountId: workerAccount.accountId,
-      balance: fragmentSize,
-      created: Date.now()
-    });
-  }
-  
-  return workers;
-}
-```
-
-### Stealth Address Generation (ERC-5564)
-
-```javascript
-// lib/stealth.js
-function generateStealthAddress(receiverMetaAddress) {
-  // Diffie-Hellman key exchange
-  const ephemeralKey = crypto.generateKeyPairSync('x25519');
-  const sharedSecret = crypto.diffieHellman({
-    privateKey: ephemeralKey.privateKey,
-    publicKey: receiverMetaAddress.spendingKey
-  });
-  
-  // Derive one-time stealth address
-  const stealthPrivKey = keccak256(
-    concat(sharedSecret, receiverMetaAddress.viewingKey)
-  );
-  
-  return {
-    stealthAddress: deriveAddress(stealthPrivKey),
-    ephemeralPubKey: ephemeralKey.publicKey,
-    viewTag: sharedSecret.slice(0, 4)
-  };
-}
-```
-
-### Private HCS Proof of Payment
-
-```javascript
-// lib/hcs-private.js
-async function sendPrivateProof(topicId, receiverPubKey, proofData) {
-  const { Client, TopicMessageSubmitTransaction } = require("@hashgraph/sdk");
-  
-  // Encrypt proof with receiver's public key
-  const encryptedProof = await encryptForReceiver(receiverPubKey, {
-    type: "PROOF_OF_ORIGIN",
-    sender: proofData.senderCommitment, // zk commitment, not identity
-    amount: proofData.amount,
-    timestamp: Date.now(),
-    memo: proofData.memo || "Private Transfer"
-  });
-  
-  // Submit to private HCS topic
-  const client = Client.forTestnet();
-  const tx = new TopicMessageSubmitTransaction()
-    .setTopicId(topicId)
-    .setMessage(encryptedProof);
-  
-  const response = await tx.execute(client);
-  return response.transactionId;
-}
-```
-
-### zk-SNARK Shielding Circuit
-
-```circom
-// circuits/shield.circom
-pragma circom 2.0.0;
-
-include "poseidon.circom";
-include "merkleTree.circom";
-
-template Shield(levels) {
-    // Public inputs
-    signal input root;
-    signal input nullifierHash;
-    
-    // Private inputs
-    signal input secret;
-    signal input nullifier;
-    signal input pathElements[levels];
-    signal input pathIndices[levels];
-    
-    // Compute commitment
-    component hasher = Poseidon(2);
-    hasher.inputs[0] <== nullifier;
-    hasher.inputs[1] <== secret;
-    signal commitment <== hasher.out;
-    
-    // Verify Merkle proof
-    component tree = MerkleTreeChecker(levels);
-    tree.leaf <== commitment;
-    tree.root <== root;
-    for (var i = 0; i < levels; i++) {
-        tree.pathElements[i] <== pathElements[i];
-        tree.pathIndices[i] <== pathIndices[i];
-    }
-    
-    // Compute nullifier hash (prevents double-spending)
-    component nullHasher = Poseidon(1);
-    nullHasher.inputs[0] <== nullifier;
-    nullifierHash === nullHasher.out;
-}
-
-component main {public [root, nullifierHash]} = Shield(20);
-```
-
----
-
-## ⚖️ Compliance: "View Key" System
-
-Vanish follows a **Compliance by Design** model:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    COMPLIANCE ARCHITECTURE                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   USER                         AUDITOR                          │
-│    │                              │                             │
-│    │  ┌─────────────────────┐     │                             │
-│    └──►   View Key Wallet   │     │                             │
-│       │  (User Controlled)  │     │                             │
-│       └──────────┬──────────┘     │                             │
-│                  │                │                             │
-│                  │  VOLUNTARY     │                             │
-│                  │  DISCLOSURE    │                             │
-│                  │                │                             │
-│                  ▼                ▼                             │
-│       ┌──────────────────────────────┐                          │
-│       │     Transaction History      │                          │
-│       │    (Decrypted with Key)      │                          │
-│       └──────────────────────────────┘                          │
-│                                                                 │
-│   ✓ User retains key custody                                    │
-│   ✓ Auditor access requires user consent                        │
-│   ✓ Public ledger remains private                               │
-│   ✓ Regulatory compliance supported                             │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🏆 Hackathon Scoring
-
-| Criteria | Score | Justification |
-|----------|-------|---------------|
-| **Innovation** | ⭐⭐⭐⭐⭐ | AI-managed privacy is a next-gen use case |
-| **Technical Complexity** | ⭐⭐⭐⭐⭐ | Integrates HTS, HCS, HIP-1340, zk-SNARKs |
-| **Real-World Utility** | ⭐⭐⭐⭐⭐ | Solves enterprise privacy concerns |
-| **Hedera Integration** | ⭐⭐⭐⭐⭐ | Uses multiple Hedera-native primitives |
-| **Code Quality** | ⭐⭐⭐⭐ | Modular, documented, production-ready |
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
-
-## 📬 Contact
-
-- **Project Lead**: [Your Name]
-- **Discord**: [Vanish Community]
-- **Twitter**: [@Vanish_Hedera]
-
----
-
-<p align="center">
-  <strong>Built with 🛡️ for the Hedera AI & Agents Track</strong>
-</p>
+## 📜 License
+MIT License. Created by the Vanish Team (2026).
