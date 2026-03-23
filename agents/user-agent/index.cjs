@@ -294,7 +294,18 @@ If a user asks to withdraw to a public account, proactively warn them about chai
   startExpressServer() {
     const app = express();
     const corsOptions = {
-      origin: process.env.FRONTEND_URL || "http://localhost:3000",
+      origin: (origin, callback) => {
+        // Trust localhost and Vercel/Ngrok domains for the privacy demo
+        if (!origin || 
+            origin.startsWith('http://localhost') || 
+            origin.includes('vercel.app') || 
+            origin.includes('ngrok-free.app')) {
+          callback(null, true);
+        } else {
+          // In a real production deployment, you would strictly whitelist one domain.
+          callback(new Error('CORS blocked: Origin not recognized'));
+        }
+      },
       methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
       credentials: true,
