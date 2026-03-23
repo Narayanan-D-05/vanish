@@ -37,6 +37,7 @@ const aiFragmentor = require('../../lib/ai-fragmentor.cjs');
 const DelegationManager = require('../../lib/delegation.cjs');
 const { generateTestInputs } = require('../../build-test-inputs.cjs');
 const VaultWrapper = require('./vault-wrapper.cjs');
+const StealthAddressGenerator = require('../../lib/stealth.cjs');
 
 // =============================================================================
 // SSE LOG STREAMING - Global Event Emitter for Real-time Terminal Output
@@ -901,6 +902,22 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       }
     }
     return total;
+  }
+
+  /**
+   * Derive a permanent Vanish meta-address for a session
+   * @param {string} evmAddress 
+   */
+  deriveMetaAddress(evmAddress) {
+    const session = this.sessions.get(evmAddress.toLowerCase());
+    if (!session) return null;
+
+    // Construct meta-address from session view/spend public keys
+    const metaAddress = StealthAddressGenerator.encodeMetaAddress(
+      Buffer.from(session.spendPublicKey, 'hex'),
+      Buffer.from(session.viewPublicKey, 'hex')
+    );
+    return metaAddress;
   }
 
   /**
@@ -3245,9 +3262,39 @@ If a user asks to withdraw to a public account, proactively warn them about chai
       console.log(`💡 Privacy Tip: Withdrawing 'round' amounts (e.g., ${Math.floor(amount)} HBAR) breaks the 'Amount Fingerprint' used by chain analysis.`);
     }
 
-    console.log(`⚠️  'Exit Point' Alert: Withdrawing to a main account (${recipientAccountId}) creates an on-chain link.`);
-    console.log(`💡 Safer Alternative: Stay inside the pool. Use 'internal-transfer' for peer-to-peer privacy.\n`);
     console.log(`✅ HIP-1340 Protection: The Pool Manager will pay the gas for this withdrawal to decouple your wallets.\n`);
+
+    // --- STEALTH WITHDRAWAL UPGRADE ---
+    // If withdrawing to self (default), we route through a one-time stealth address.
+    const isSelfWithdrawal = recipientAccountId.toLowerCase() === this.accountId.toEvmAddress().toLowerCase();
+    let finalRecipient = recipientAccountId;
+    let stealthAnnouncement = null;
+
+    if (isSelfWithdrawal) {
+      console.log(`🕵️  Stealth Mode: Routing withdrawal through a one-time "Ghost Address" for maximum privacy.`);
+      const metaAddress = this.deriveMetaAddress(evmAddress || this.activeSessionAddress);
+      
+      if (metaAddress) {
+        const stealth = StealthAddressGenerator.generateStealthAddress(metaAddress);
+        finalRecipient = stealth.stealthPublicKey; // Hedera Alias (EVM Address)
+        
+        // Prepare announcement so Agent can "catch" it later via Sync
+        stealthAnnouncement = {
+          type: 'STEALTH_TRANSFER',
+          stealthAddress: finalRecipient,
+          ephemeralPublicKey: stealth.ephemeralPublicKey,
+          amount: amount,
+          recipientAccountId: recipientAccountIdRaw, // Original main account
+          senderAccountId: 'VANISH_POOL',
+          viewTag: stealth.viewTag,
+          timestamp: Date.now()
+        };
+        
+        console.log(`   💎 Generated Stealth Recipient: ${finalRecipient}`);
+      } else {
+        console.warn(`   ⚠️ Could not derive Stealth Meta-Address for this session. Falling back to public withdrawal.`);
+      }
+    }
 
     // 2. Secret Resolution (using live userSecrets Map, not cached blindedVault)
     let selectedSecretIds = [];
@@ -3319,14 +3366,14 @@ If a user asks to withdraw to a public account, proactively warn them about chai
         secret: actualSecret,
         nullifier: actualNullifier,
         amount: fragAmount,
-        recipient: recipientAccountId,
+        recipient: finalRecipient, // [STEALTH_WITHDRAW]
         merkleRoot: testData.merkleRoot, // Must match testData path for demo
         merklePathElements: testData.merklePathElements,
         merklePathIndices: testData.merklePathIndices
       });
 
       this.logger.logic(`Generating withdrawal proof for ${fragAmount} HBAR...`, {
-        recipient: recipientAccountId,
+        recipient: finalRecipient, // [STEALTH_WITHDRAW]
         merkleRoot: statusData.currentMerkleRoot || statusData.merkleRoot,
         inputs: this.logger.redact(testData)
       });
@@ -3353,11 +3400,19 @@ If a user asks to withdraw to a public account, proactively warn them about chai
             secretId: sid,
             submissionId: finalData.submissionId || crypto.randomBytes(16).toString('hex'),
             amount: fragAmount,
-            recipient: recipientAccountId,
+            recipient: finalRecipient,
             submittedAt: Date.now(),
             status: 'PENDING'
           });
           this.savePendingWithdrawals();
+          
+          // [STEALTH_WITHDRAW] Announcement - enables Ghost Sync auto-discovery
+          if (stealthAnnouncement) {
+            console.log(`   📡 Announcing stealth withdrawal (Ghost Sync enabled)...`);
+            const hcs = require('../../lib/hip1334.cjs');
+            await hcs.sendEncryptedMessage(this.client, this.accountId.toString(), stealthAnnouncement);
+          }
+
           console.log(`   ⏳ Added to pending withdrawals (will mark as used when confirmed)`);
         }
       }
