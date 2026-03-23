@@ -1220,12 +1220,14 @@ class PoolManager {
     const pC = [proofData.proof.pi_c[0], proofData.proof.pi_c[1]];
 
     // Log proof parameters for debugging
-    console.log(`   🔐 Proof parameters:`);
-    console.log(`      Amount: ${amountTinybars} tinybars (${Number(amountTinybars) / 1e8} HBAR)`);
-    console.log(`      Nullifier: ${String(nullifierHash).slice(0, 18)}...`);
-    console.log(`      Commitment: ${commitmentHex.slice(0, 18)}...`);
-    console.log(`      Root: ${rootHex.slice(0, 18)}...`);
-    console.log(`      Recipient: ${isInternalSwap ? 'INTERNAL SWAP' : recipient}`);
+    if (process.env.ENABLE_DEBUG === 'true') {
+      console.log(`   🔐 Proof parameters:`);
+      console.log(`      Amount: ${amountTinybars} tinybars (${Number(amountTinybars) / 1e8} HBAR)`);
+      console.log(`      Nullifier: ${String(nullifierHash).slice(0, 18)}...`);
+      console.log(`      Commitment: ${commitmentHex.slice(0, 18)}...`);
+      console.log(`      Root: ${rootHex.slice(0, 18)}...`);
+      console.log(`      Recipient: ${isInternalSwap ? 'INTERNAL SWAP' : recipient}`);
+    }
 
     // Verify proof locally before submitting to contract
     try {
@@ -1385,10 +1387,12 @@ class PoolManager {
         .execute(this.client);
       const currentRoot = iface.decodeFunctionResult('currentMerkleRoot', currentResult.bytes)[0];
 
-      console.log(`🔍 Root check for ${normalizedRoot.slice(0, 18)}...:`);
-      console.log(`   In rootHistory: ${inHistory ? '✅ YES' : '❌ NO'}`);
-      console.log(`   Is current root: ${currentRoot.toLowerCase() === normalizedRoot.toLowerCase() ? '✅ YES' : '❌ NO'}`);
-      console.log(`   Current contract root: ${currentRoot.slice(0, 18)}...`);
+      if (process.env.ENABLE_DEBUG === 'true') {
+        console.log(`🔍 Root check for ${normalizedRoot.slice(0, 18)}...:`);
+        console.log(`   In rootHistory: ${inHistory ? '✅ YES' : '❌ NO'}`);
+        console.log(`   Is current root: ${currentRoot.toLowerCase() === normalizedRoot.toLowerCase() ? '✅ YES' : '❌ NO'}`);
+        console.log(`   Current contract root: ${currentRoot.slice(0, 18)}...`);
+      }
 
       return { inHistory, isCurrent: currentRoot.toLowerCase() === normalizedRoot.toLowerCase(), currentRoot };
     } catch (err) {
