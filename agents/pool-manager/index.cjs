@@ -581,12 +581,9 @@ class PoolManager {
     const axios = require('axios');
 
     // ─── TIER 1: Chainalysis Sanctions REST API ────────────────────────────────
-    // Free API for OFAC SDN sanctions screening. 5,000 req / 5 min.
-    // Auth: X-API-KEY header. Docs: https://docs.chainalysis.com/api/sanctions/
     const apiKey = process.env.CHAINALYSIS_API_KEY;
     if (apiKey) {
       try {
-        // Resolve Hedera account to EVM address first
         const mirrorBase = process.env.MIRROR_NODE_URL || 'https://testnet.mirrornode.hedera.com';
         const evmRes = await axios.get(`${mirrorBase}/api/v1/accounts/${accountId}`, { timeout: 5000 });
         const evmAddress = evmRes.data?.evm_address;
@@ -611,8 +608,9 @@ class PoolManager {
 
           console.log(`✅ [Chainalysis Sanctions API] ${accountId} — Not on OFAC SDN list. Score: 0`);
           return 0;
+        } else {
+          console.warn(`⚠️ [AML] Mirror Node could not resolve EVM address for ${accountId}. Skipping Tier 1 REST check.`);
         }
-
       } catch (sanctionsErr) {
         console.warn(`⚠️ [Sanctions API] Request failed (${sanctionsErr.response?.status || sanctionsErr.message}). Falling back to on-chain oracle.`);
       }
@@ -646,13 +644,24 @@ class PoolManager {
         }
         console.log(`✅ [On-Chain Oracle] ${accountId} is CLEAN.`);
         return 0;
+      } else {
+        console.warn(`⚠️ [AML] Mirror Node could not resolve EVM address for ${accountId}. Skipping Tier 2 On-Chain check.`);
       }
     } catch (onChainErr) {
       console.warn(`⚠️ [On-Chain Oracle] Failed (${onChainErr.message}).`);
     }
 
-    // ─── TIER 3: Strict failure (No Fallbacks) ─────────────────────────────────
-    console.warn(`⚠️ [AML] Both oracle tiers failed for ${accountId}. Rejecting to enforce strict compliance.`);
+    // ─── TIER 3: Safe Exit (Fallbacks) ────────────────────────────────────────
+    const isTestnet = process.env.HEDERA_NETWORK === 'testnet';
+    const allowSafeExit = isTestnet || process.env.ALLOW_OFFLINE_COMPLIANCE === 'true';
+
+    if (allowSafeExit) {
+      console.warn(`⚠️ [AML] Both oracle tiers failed for ${accountId}.`);
+      console.warn(`   Failsafe activated: using Safe Exit (Score: 0) for ${process.env.HEDERA_NETWORK} environment.`);
+      return 0;
+    }
+
+    console.warn(`🚨 [AML] Both oracle tiers failed for ${accountId}. Rejecting to enforce strict compliance.`);
     throw new Error('Compliance oracles unreachable. Failsafe activated: rejected.');
   }
 
@@ -663,7 +672,6 @@ class PoolManager {
       return false;
     }
 
-    console.log(`🔍 [DEBUG] Validating proof ${proofData.submissionId} (Type: ${proofData.proofType})...`);
     const isValid = await this.verifyProof(proofData.proof, proofData.publicSignals, proofData.proofType);
     if (!isValid) {
       console.log(`❌ Rejected invalid proof: ${proofData.submissionId}`);
@@ -1582,7 +1590,6 @@ class PoolManager {
     // To prevent compute exhaustion (DoS) and gas draining, we ONLY accept 
     // mathematically perfect denominations. Dust amounts are dropped instantly.
     const type = (payload.proofType || '').toUpperCase();
-    console.log(`🔍 [DEBUG] handleMessage type: ${type}, amount: ${payload.amount}`);
     if (type === 'SHIELD' || type === 'WITHDRAW') {
       const amt = parseFloat(payload.amount);
       const policy = require('../../config/vanish-policy.json');
