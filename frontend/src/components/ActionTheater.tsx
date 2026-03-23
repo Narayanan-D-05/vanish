@@ -1,8 +1,9 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Shield, Send, VenetianMask, Loader2, Check, X, ChevronRight } from "lucide-react";
+import { Shield, Send, VenetianMask, Loader2, ChevronRight } from "lucide-react";
 import { useWallet } from "@/contexts/WalletProvider";
 import { sendCommand } from "@/lib/api";
 
