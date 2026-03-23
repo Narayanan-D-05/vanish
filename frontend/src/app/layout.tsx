@@ -15,6 +15,9 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "Vanish Protocol - AI-Powered Privacy",
   description: "Zero-knowledge privacy pool with AI-driven fragmentation on Hedera",
+  icons: {
+    icon: "/favicon.ico?v=2",
+  },
 };
 
 export default function RootLayout({
