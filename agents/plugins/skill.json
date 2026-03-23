@@ -1,0 +1,19 @@
+{
+  "name": "vanishtools",
+  "version": "1.0.0",
+  "description": "Privacy tools for Hedera AI Agents featuring ZK-proofs and stealth transfers via HIP-1334.",
+  "tags": [
+    "privacy",
+    "zk-proofs",
+    "stealth-transfers",
+    "hedera",
+    "a2a"
+  ],
+  "category": "utility",
+  "author": "Vanish Protocol Team",
+  "license": "MIT",
+  "homepage": "https://vanish.sh",
+  "bugs": "https://github.com/vanish/vanish-tools/issues",
+  "repo": "https://github.com/vanish/vanish-tools",
+  "main": "index.js"
+}

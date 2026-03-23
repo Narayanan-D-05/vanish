@@ -1,0 +1,26 @@
+{
+  "name": "vanish-tools",
+  "version": "1.0.0",
+  "description": "Vanish AI Privacy Agent Toolkit featuring ZK-proofs and stealth transfers via HIP-1334.",
+  "type": "ai-agents",
+  "author": "Vanish Protocol Team",
+  "license": "MIT",
+  "capabilities": [
+    "privacy",
+    "financial-services",
+    "zk-proofs",
+    "messaging"
+  ],
+  "protocols": [
+    "hcs-10",
+    "a2a",
+    "hip-1334"
+  ],
+  "endpoints": {
+    "hcs": "0.0.8274009"
+  },
+  "metadata": {
+    "homepage": "https://vanish.sh",
+    "repo": "https://github.com/vanish/vanish-tools"
+  }
+}
